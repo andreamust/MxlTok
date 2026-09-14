@@ -1,0 +1,71 @@
+[project]
+name = "mxltok"
+dynamic = ["version"]
+description = "Tokenize MusicXML scores into LMX (Linearized MusicXML) token sequences and back."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrea Poltronieri" }]
+requires-python = ">=3.10"
+keywords = ["musicxml", "tokenizer", "symbolic music", "music generation", "lmx"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = ["tokenizers>=0.20"]
+
+[project.optional-dependencies]
+hub = ["huggingface_hub>=0.24"]
+
+[project.urls]
+Homepage = "https://github.com/andreamust/MxlTok"
+Repository = "https://github.com/andreamust/MxlTok"
+Issues = "https://github.com/andreamust/MxlTok/issues"
+Changelog = "https://github.com/andreamust/MxlTok/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.12", "mypy>=1.13"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/mxltok/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "CHANGELOG.md", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib", "-q"]
+pythonpath = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "PTH", "D"]
+ignore = ["D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "E501"]
+"scripts/**" = ["D"]
+
+[tool.mypy]
+files = ["src"]
+strict = true
