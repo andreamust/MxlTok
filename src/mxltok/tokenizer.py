@@ -1,733 +1,382 @@
-"""Base tokenizer: vocabulary, ids/tokens/bytes conversions, encode/decode."""
+"""The :class:`MXLTokenizer`: MusicXML scores to LMX tokens and ids, and back."""
 
 from __future__ import annotations
 
 import json
-import sys
-import warnings
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence, Sized
-from concurrent.futures import ProcessPoolExecutor
-from functools import partial
-from os import cpu_count
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-from huggingface_hub import ModelHubMixin, hf_hub_download
-from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
+from mxltok.arrangement import join_parts, split_parts
+from mxltok.bpe import BPE
+from mxltok.categories import filter_tokens, reorder_tokens
+from mxltok.config import TokenizerConfig
+from mxltok.decoding import PartDecoder
+from mxltok.encoding import PartEncoder
+from mxltok.errors import MxlTokError
+from mxltok.instruments import (
+    CATEGORY_TO_MIDI_PROGRAM,
+    DEFAULT_MIDI_CHANNEL,
+    DRUMS_MIDI_CHANNEL,
+    instrument_category,
+)
+from mxltok.musicxml import read_musicxml
+from mxltok.score import Part, Score
+from mxltok.vocabulary import INSTRUMENT_PREFIX, NUM_PARTS_PREFIX, build_vocabulary
 
-from mxltok.classes import Event, MxlTokError, TokenizerConfig, TokSequence
-from mxltok.constants import CHR_ID_START
-from mxltok.musicxml import dump, load
-from mxltok.score import Score
-from mxltok.utils import TokTrainingIterator, deepest_common_dir, get_files_paths
-
-BOS_TOKEN_NAME = "BOS"
-EOS_TOKEN_NAME = "EOS"
-DEFAULT_TOKENIZER_FILE_NAME = "tokenizer.json"
-DEFAULT_TRAINING_MODEL = "BPE"
-WORDPIECE_MAX_INPUT_CHARS_PER_WORD = 400
-UNIGRAM_MAX_PIECE_LENGTH = 200
-TrainingModel = Literal["BPE", "Unigram", "WordPiece"]
+TOKENIZER_FILE = "tokenizer.json"
+_TOKENIZER_CLASS = "MXLTokenizer"
 
 
-class MusicTokenizer(ABC, ModelHubMixin, library_name="MxlTok"):
-    """Abstract MusicXML tokenizer with a MidiTok-like interface.
+@dataclass
+class TokSequence:
+    """An encoded score: its tokens and their ids.
 
-    Subclasses implement the four hooks: :meth:`_create_base_vocabulary`,
-    :meth:`_create_token_types_graph`, :meth:`_score_to_tokens` and
-    :meth:`_tokens_to_score`.
+    ``ids`` are BPE ids when the tokenizer has a trained BPE model, base
+    vocabulary ids otherwise. ``tokens`` are always base tokens.
+    """
 
-    :param tokenizer_config: the tokenizer's configuration.
-    :param params: path to a saved tokenizer (``tokenizer.json``) to load
-        instead; ``tokenizer_config`` is then ignored.
+    tokens: list[str] = field(default_factory=list)
+    ids: list[int] = field(default_factory=list)
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+
+class MXLTokenizer:
+    """Tokenizes MusicXML scores into LMX tokens and decodes them back.
+
+    Example:
+        >>> tokenizer = MXLTokenizer()
+        >>> sequence = tokenizer.encode("score.mxl")
+        >>> sequence.tokens[:4]
+        ['<BOS>', 'num_parts:1', 'part:instrument:Piano', 'part:start']
+        >>> score = tokenizer.decode(sequence.ids)
+
+    Args:
+        config: The tokenization options; the defaults when omitted.
+        vocab: The base vocabulary in id order; built from ``config`` when
+            omitted. Restored tokenizers pass their saved vocabulary.
+        bpe: A trained BPE model over the base vocabulary.
     """
 
     def __init__(
         self,
-        tokenizer_config: TokenizerConfig | None = None,
-        params: str | Path | None = None,
+        config: TokenizerConfig | None = None,
+        *,
+        vocab: Sequence[str] | None = None,
+        bpe: BPE | None = None,
     ) -> None:
-        self._vocab_base: dict[str, int] = {}
-        self._vocab_base_inv: dict[int, str] = {}
-        self._vocab_base_id_to_byte: dict[int, str] = {}
-        self._vocab_base_byte_to_token: dict[str, str] = {}
-        self._vocab_learned_bytes_to_tokens: dict[str, list[str]] = {}
-        self._model: Tokenizer | None = None
-        self._token_types_indexes: dict[str, list[int]] = {}
-        self.tokens_types_graph: dict[str, set[str]] = {}
-        if params is not None:
-            self._load_from_json(params)
-        else:
-            self.config = (
-                tokenizer_config if tokenizer_config is not None else TokenizerConfig()
-            )
-        if not self._vocab_base:
-            self._create_vocabulary()
-        self._update_token_types_indexes()
-        self.tokens_types_graph = self._create_token_types_graph()
-        self._add_special_tokens_to_types_graph()
+        self.config = config if config is not None else TokenizerConfig()
+        special_tokens = self.config.special_tokens.as_list()
+        if vocab is None:
+            vocab = build_vocabulary(special_tokens, self.config.pitch_mode)
+        missing = [token for token in special_tokens if token not in vocab]
+        if missing:
+            raise MxlTokError(f"Special tokens missing from the vocabulary: {missing}")
+        self._vocab = list(vocab)
+        self._id_of = {token: id_ for id_, token in enumerate(self._vocab)}
+        self.bpe = bpe
+        self._encoder = PartEncoder(self.config)
 
-    @abstractmethod
-    def _create_base_vocabulary(self) -> list[str]:
-        """Return the base tokens (without special tokens), in vocabulary order."""
+    def __repr__(self) -> str:
+        bpe = f", bpe_vocab_size={self.bpe.vocab_size}" if self.bpe else ""
+        return f"MXLTokenizer(base_vocab_size={len(self._vocab)}{bpe})"
 
-    @abstractmethod
-    def _create_token_types_graph(self) -> dict[str, set[str]]:
-        """Return the allowed successions of token types (for ``tokens_errors``)."""
-
-    @abstractmethod
-    def _score_to_tokens(self, score: Score, strict: bool) -> TokSequence:
-        """Tokenize a :class:`Score` into a sequence with its ``events`` filled."""
-
-    @abstractmethod
-    def _tokens_to_score(self, tokens: list[str], strict: bool) -> Score:
-        """Rebuild a :class:`Score` from a list of tokens."""
-
-    def _create_vocabulary(self) -> None:
-        for token in self.config.special_tokens:
-            self.add_to_vocab(token, special_token=True)
-        for token in self._create_base_vocabulary():
-            self.add_to_vocab(token)
-
-    def add_to_vocab(
-        self, token: str | Event, special_token: bool = False, byte_: str | None = None
-    ) -> None:
-        """Add a token to the base vocabulary (no-op if already present)."""
-        token = str(token)
-        if token in self._vocab_base:
-            return
-        id_ = len(self._vocab_base)
-        self._vocab_base[token] = id_
-        self._vocab_base_inv[id_] = token
-        if byte_ is None:
-            byte_ = chr(id_ + CHR_ID_START)
-        self._vocab_base_id_to_byte[id_] = byte_
-        self._vocab_base_byte_to_token[byte_] = token
-        if not special_token:
-            self._token_types_indexes.setdefault(token.split("_")[0], []).append(id_)
-
-    def _update_token_types_indexes(self) -> None:
-        self._token_types_indexes = {}
-        for token, id_ in self._vocab_base.items():
-            if token not in self.config.special_tokens:
-                self._token_types_indexes.setdefault(token.split("_")[0], []).append(
-                    id_
-                )
-
-    def _add_special_tokens_to_types_graph(self) -> None:
-        base_types = set(self.tokens_types_graph)
-        for special_token in self.config.special_tokens:
-            type_ = special_token.split("_")[0]
-            if type_ == EOS_TOKEN_NAME:
-                self.tokens_types_graph[type_] = set()
-            else:
-                self.tokens_types_graph[type_] = base_types | {
-                    t.split("_")[0] for t in self.config.special_tokens
-                }
-            if type_ != BOS_TOKEN_NAME:
-                for base_type in base_types:
-                    self.tokens_types_graph[base_type].add(type_)
+    # ---------------------------------------------------------- vocabulary
 
     @property
-    def vocab(self) -> dict[str, int]:
-        """The base vocabulary, token -> id."""
-        return self._vocab_base
+    def vocab(self) -> list[str]:
+        """The base vocabulary, in id order."""
+        return list(self._vocab)
 
     @property
-    def vocab_model(self) -> dict[str, int] | None:
-        """The trained model's vocabulary (bytes -> id), or ``None`` if untrained."""
-        return None if self._model is None else self._model.get_vocab()
+    def base_vocab_size(self) -> int:
+        """The number of base tokens."""
+        return len(self._vocab)
 
     @property
     def vocab_size(self) -> int:
-        return len(self)
+        """The number of ids: the size of a model's embedding table."""
+        return self.bpe.vocab_size if self.bpe is not None else len(self._vocab)
 
     @property
-    def special_tokens(self) -> tuple[str, ...]:
-        return self.config.special_tokens
+    def pad_id(self) -> int:
+        """The id of the padding token."""
+        return self.token_to_id(self.config.special_tokens.pad)
 
     @property
-    def special_tokens_ids(self) -> list[int]:
-        return [self._vocab_base[token] for token in self.config.special_tokens]
+    def bos_id(self) -> int:
+        """The id of the beginning-of-sequence token."""
+        return self.token_to_id(self.config.special_tokens.bos)
 
     @property
-    def pad_token_id(self) -> int:
-        return self._vocab_base["PAD_None"]
+    def eos_id(self) -> int:
+        """The id of the end-of-sequence token."""
+        return self.token_to_id(self.config.special_tokens.eos)
 
     @property
-    def is_trained(self) -> bool:
-        return self._model is not None
+    def unk_id(self) -> int:
+        """The id of the unknown token."""
+        return self.token_to_id(self.config.special_tokens.unk)
 
-    def token_ids_of_type(self, token_type: str) -> list[int]:
-        """Ids of all base tokens of a type, e.g. ``"Pitch"``."""
-        return list(self._token_types_indexes.get(token_type, []))
+    @property
+    def mask_id(self) -> int:
+        """The id of the mask token."""
+        return self.token_to_id(self.config.special_tokens.mask)
 
-    def token_id_type(self, id_: int) -> str:
-        """Type of a base token id."""
-        return self._vocab_base_inv[id_].split("_")[0]
+    def token_to_id(self, token: str) -> int:
+        """Return the id of a single token."""
+        if self.bpe is not None:
+            return self.bpe.token_to_id(token)
+        if token not in self._id_of:
+            raise MxlTokError(f"Token {token!r} is not in the vocabulary")
+        return self._id_of[token]
 
-    def encode(
-        self, score: Score | str | Path, encode_ids: bool = True, strict: bool = False
-    ) -> TokSequence:
-        """Tokenize a :class:`Score` or a MusicXML file.
+    def tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
+        """Return the ids of a token sequence (BPE-encoded if BPE is trained)."""
+        unknown = [token for token in tokens if token not in self._id_of]
+        if unknown:
+            raise MxlTokError(f"Tokens not in the vocabulary: {sorted(set(unknown))}")
+        if self.bpe is not None:
+            return self.bpe.encode(tokens)
+        return [self._id_of[token] for token in tokens]
 
-        :param score: score object or path to a ``.musicxml``/``.xml``/``.mxl``.
-        :param encode_ids: apply the trained model (BPE...) to the ids, if any.
-        :param strict: raise :class:`MxlTokError` on unsupported content instead
-            of warning and skipping it.
+    def ids_to_tokens(self, ids: Iterable[int]) -> list[str]:
+        """Return the base tokens of ids (BPE-decoded if BPE is trained)."""
+        if self.bpe is not None:
+            return self.bpe.decode(ids)
+        try:
+            return [self._vocab[id_] for id_ in ids]
+        except IndexError as exc:
+            raise MxlTokError("Id out of the vocabulary range") from exc
+
+    # ------------------------------------------------------------ encoding
+
+    def encode(self, score: Score | str | Path) -> TokSequence:
+        """Tokenize a score or a MusicXML file (``.mxl``, ``.musicxml``, ``.xml``).
+
+        Raises:
+            MxlTokError: If the file cannot be read, or the score contains
+                content outside the vocabulary.
         """
         if not isinstance(score, Score):
-            score = load(score)
-        seq = self._score_to_tokens(score, strict)
-        self.complete_sequence(seq)
-        if encode_ids and self.is_trained:
-            self.encode_token_ids(seq)
-        return seq
+            score = read_musicxml(score)
+        tokens = self.encode_tokens(score)
+        return TokSequence(tokens, self.tokens_to_ids(tokens))
 
-    def complete_sequence(self, seq: TokSequence, complete_bytes: bool = False) -> None:
-        """Fill the missing ``tokens``/``ids`` (and ``bytes``) forms of a sequence."""
-        if not seq.tokens:
-            if seq.events:
-                seq.tokens = [str(event) for event in seq.events]
-            elif seq.ids:
-                seq.tokens = self._ids_to_tokens(seq.ids)
-            elif seq.bytes:
-                seq.tokens = self._bytes_to_tokens(seq.bytes)
-        if not seq.ids:
-            seq.ids = self._tokens_to_ids(seq.tokens)
-        if complete_bytes and self.is_trained and not seq.bytes:
-            seq.bytes = self._ids_to_bytes(seq.ids)
-
-    def _tokens_to_ids(self, tokens: Sequence[str]) -> list[int]:
-        return [self._vocab_base[token] for token in tokens]
-
-    def _ids_to_tokens(self, ids: Sequence[int]) -> list[str]:
-        return [self._vocab_base_inv[id_] for id_ in ids]
-
-    def _ids_to_bytes(self, ids: Sequence[int]) -> str:
-        return "".join(self._vocab_base_id_to_byte[id_] for id_ in ids)
-
-    def _bytes_to_tokens(self, bytes_: str) -> list[str]:
-        return [
-            token
-            for byte_ in bytes_
-            for token in self._vocab_learned_bytes_to_tokens[byte_]
-        ]
-
-    def train(
-        self,
-        vocab_size: int,
-        model: TrainingModel | models.Model | None = None,
-        iterator: Iterable[str | list[str]] | None = None,
-        files_paths: Sequence[str | Path] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Learn a BPE, Unigram or WordPiece vocabulary with 🤗 tokenizers.
-
-        Token ids are mapped to unique characters (bytes) which the model
-        merges; with ``config.encode_ids_split == "bar"`` each bar is a "word".
-
-        :param vocab_size: target vocabulary size (must exceed the base vocab).
-        :param model: model name, a ``tokenizers.models.Model`` instance, or
-            ``None`` to retrain the current model (``"BPE"`` if untrained).
-        :param iterator: sized iterable of byte strings (or lists of them);
-            defaults to a :class:`TokTrainingIterator` over ``files_paths``.
-        :param files_paths: MusicXML files to train on when no iterator is given.
-        :param kwargs: extra arguments for the 🤗 trainer.
-        """
-        if iterator is None and files_paths is None:
-            raise ValueError("Give an iterator or a list of files to train on.")
-        if vocab_size <= len(self._vocab_base):
-            warnings.warn(
-                f"vocab_size ({vocab_size}) must exceed the base vocabulary "
-                f"({len(self._vocab_base)}); skipping training.",
-                stacklevel=2,
-            )
-            return
-        if iterator is None:
-            assert files_paths is not None
-            iterator = TokTrainingIterator(self, files_paths)
-        initial_alphabet = list(self._vocab_base_id_to_byte.values())
-        split = self.config.encode_ids_split != "no"
-
-        if model is None and self._model is not None:
-            tokenizer = self._reset_hf_tokenizer(self._model)
-        elif isinstance(model, models.Model):
-            tokenizer = Tokenizer(model)
-        else:
-            name = model or DEFAULT_TRAINING_MODEL
-            model_kwargs: dict[str, Any] = {}
-            if name in ("BPE", "WordPiece"):
-                model_kwargs["vocab"] = {b: i for i, b in enumerate(initial_alphabet)}
-                if split:
-                    model_kwargs["continuing_subword_prefix"] = ""
-            if name == "BPE":
-                model_kwargs["merges"] = []
-                if split:
-                    model_kwargs["end_of_word_suffix"] = ""
-            elif name == "WordPiece":
-                model_kwargs["unk_token"] = kwargs.pop(
-                    "unk_token", self._vocab_base_id_to_byte[self.pad_token_id]
-                )
-                model_kwargs["max_input_chars_per_word"] = kwargs.pop(
-                    "max_input_chars_per_word", WORDPIECE_MAX_INPUT_CHARS_PER_WORD
-                )
-            elif name != "Unigram":
-                raise ValueError(f"Unknown training model {model!r}")
-            tokenizer = Tokenizer(getattr(models, name)(**model_kwargs))
-            if split:
-                tokenizer.pre_tokenizer = pre_tokenizers.Metaspace()
-                tokenizer.decoder = decoders.Metaspace()
-        model_json = json.loads(tokenizer.to_str())["model"]
-        model_name = model_json["type"]
-        if model_name == "WordPiece" and not split:
-            warnings.warn(
-                "Training WordPiece without splitting ids per bar: sequences longer "
-                "than max_input_chars_per_word "
-                f"({model_json['max_input_chars_per_word']}) become unknown tokens.",
-                stacklevel=2,
-            )
-        special_tokens = [
-            AddedToken(self._vocab_base_id_to_byte[id_])
-            for id_ in self.special_tokens_ids
-        ]
-        if model_name in ("BPE", "WordPiece"):
-            kwargs.setdefault(
-                "continuing_subword_prefix",
-                model_json["continuing_subword_prefix"] or "",
-            )
-            if model_name == "BPE":
-                kwargs.setdefault(
-                    "end_of_word_suffix", model_json["end_of_word_suffix"] or ""
-                )
-        elif model_name == "Unigram":
-            kwargs.setdefault("max_piece_length", UNIGRAM_MAX_PIECE_LENGTH)
-            if model_json["unk_id"] is not None:
-                kwargs.setdefault(
-                    "unk_token", model_json["vocab"][model_json["unk_id"]][0]
-                )
-        trainer_cls = getattr(
-            trainers, f"{'Bpe' if model_name == 'BPE' else model_name}Trainer"
-        )
-        trainer = trainer_cls(
-            vocab_size=vocab_size,
-            show_progress=kwargs.pop("show_progress", False),
-            special_tokens=special_tokens,
-            initial_alphabet=initial_alphabet,
-            **kwargs,
-        )
-        length = len(iterator) if isinstance(iterator, Sized) else None
-        tokenizer.train_from_iterator(iterator, trainer=trainer, length=length)
-        self._model = tokenizer
-        self._create_vocab_learned_bytes_to_tokens()
-
-    @staticmethod
-    def _reset_hf_tokenizer(tokenizer: Tokenizer) -> Tokenizer:
-        """Same model type and settings, empty vocabulary (for retraining)."""
-        tokenizer_json = json.loads(tokenizer.to_str())
-        model = tokenizer_json["model"]
-        if model["type"] == "BPE":
-            model["vocab"], model["merges"] = {}, []
-        elif model["type"] == "Unigram":
-            if model["unk_id"] is not None:
-                model["vocab"] = [[model["vocab"][model["unk_id"]][0], 0.0]]
-                model["unk_id"] = 0
-            else:
-                model["vocab"] = []
-        elif model["type"] == "WordPiece":
-            model["vocab"] = {}
-        else:
-            raise ValueError(f"Cannot retrain a {model['type']} model")
-        return Tokenizer.from_str(json.dumps(tokenizer_json))
-
-    def _create_vocab_learned_bytes_to_tokens(self) -> None:
-        assert self._model is not None
-        model_json = json.loads(self._model.to_str())
-        prefix = model_json["model"].get("continuing_subword_prefix") or ""
-        suffix = model_json["model"].get("end_of_word_suffix") or ""
-        replacement = ""
-        if isinstance(self._model.pre_tokenizer, pre_tokenizers.Metaspace):
-            replacement = self._model.pre_tokenizer.replacement
-        self._vocab_learned_bytes_to_tokens = {}
-        for learned in self._model.get_vocab():
-            key = learned.removeprefix(prefix) if prefix else learned
-            key = key.removesuffix(suffix) if suffix else key
-            key = key.removeprefix(replacement) if replacement else key
-            self._vocab_learned_bytes_to_tokens[learned] = [
-                self._vocab_base_byte_to_token[byte_] for byte_ in key
+    def encode_tokens(self, score: Score) -> list[str]:
+        """Return the tokens of a score, filtered and wrapped as configured."""
+        config = self.config
+        parts = score.parts[: config.max_parts] if config.max_parts else score.parts
+        encoded = [(instrument_category(p), self._encoder.encode(p)) for p in parts]
+        tokens = join_parts(encoded, config.arrangement)
+        if parts and config.prepend_instruments:
+            tokens = [
+                f"{NUM_PARTS_PREFIX}{len(parts)}",
+                *(f"{INSTRUMENT_PREFIX}{instrument}" for instrument, _ in encoded),
+                *tokens,
             ]
+        if config.excluded_categories:
+            tokens = filter_tokens(tokens, config.excluded_categories)
+        if config.token_order is not None:
+            tokens = reorder_tokens(tokens, config.token_order)
+        if config.add_bos_eos:
+            special = config.special_tokens
+            tokens = [special.bos, *tokens, special.eos]
+        return tokens
 
-    def encode_token_ids(self, seq: TokSequence | list[TokSequence]) -> None:
-        """Encode the ids of the sequence(s) with the trained model (in place)."""
-        if self._model is None:
-            raise RuntimeError("The tokenizer is not trained.")
-        for sequence in seq if isinstance(seq, list) else [seq]:
-            chunks = self._split_bytes(sequence)
-            sequence.ids = self._model.encode(chunks, is_pretokenized=True).ids
-            sequence.are_ids_encoded = True
-
-    def _split_bytes(self, seq: TokSequence) -> list[str]:
-        if seq.are_ids_encoded:
-            self.decode_token_ids(seq)
-        self.complete_sequence(seq, complete_bytes=True)
-        if self.config.encode_ids_split == "bar":
-            return [chunk.bytes for chunk in seq.split_per_bars() if len(chunk) > 0]
-        return [seq.bytes]
-
-    def decode_token_ids(self, seq: TokSequence | list[TokSequence]) -> None:
-        """Turn model-encoded ids back into base ids and tokens (in place)."""
-        if isinstance(seq, list):
-            for sequence in seq:
-                self.decode_token_ids(sequence)
-            return
-        if not seq.are_ids_encoded:
-            return
-        assert self._model is not None
-        tokens: list[str] = []
-        for id_ in seq.ids:
-            learned = self._model.id_to_token(id_)
-            if learned is None:
-                raise MxlTokError(f"Id {id_} is not in the trained vocabulary")
-            tokens += self._vocab_learned_bytes_to_tokens[learned]
-        seq.tokens = tokens
-        seq.ids = self._tokens_to_ids(tokens)
-        seq.bytes = ""
-        seq.are_ids_encoded = False
+    # ------------------------------------------------------------ decoding
 
     def decode(
         self,
-        tokens: TokSequence | Sequence[int] | Sequence[str] | Any,
-        output_path: str | Path | None = None,
+        sequence: TokSequence | Sequence[int] | Sequence[str],
         strict: bool = False,
     ) -> Score:
-        """Detokenize a sequence (``TokSequence``, ids, tokens, tensor) to a score.
+        """Rebuild a score from a sequence of ids or tokens.
 
-        :param tokens: the sequence; ids may be a list, numpy array or tensor.
-        :param output_path: also write the MusicXML file there (``.mxl`` = zipped).
-        :param strict: raise on grammar violations instead of repairing them.
+        Write it to a file with :func:`mxltok.write_musicxml`.
+
+        Args:
+            sequence: A :class:`TokSequence`, ids (a list, NumPy array or
+                tensor) or tokens. Special tokens are ignored.
+            strict: Raise :class:`MxlTokError` on malformed tokens instead of
+                skipping them with a warning.
         """
-        seq = self._convert_sequence_to_tokseq(tokens)
-        if seq.are_ids_encoded:
-            self.decode_token_ids(seq)
-        self.complete_sequence(seq)
-        score = self._tokens_to_score(seq.tokens, strict)
-        if output_path is not None:
-            dump(score, output_path)
+        tokens = self._as_tokens(sequence)
+        special = set(self.config.special_tokens.as_list())
+        tokens = [token for token in tokens if token not in special]
+        parts = split_parts(tokens, self.config.arrangement) or [(None, tokens)]
+        decoder = PartDecoder(strict)
+        score = Score()
+        for number, (category, part_tokens) in enumerate(parts, start=1):
+            part = Part(id=f"P{number}", name=category or f"Part {number}")
+            if category is not None:
+                part.midi_program = CATEGORY_TO_MIDI_PROGRAM.get(category, 1)
+                part.midi_channel = (
+                    DRUMS_MIDI_CHANNEL if category == "Drums" else DEFAULT_MIDI_CHANNEL
+                )
+            part.measures = decoder.decode(part_tokens)
+            score.parts.append(part)
         return score
 
-    def _convert_sequence_to_tokseq(
-        self, input_seq: TokSequence | Sequence[int] | Sequence[str] | Any
-    ) -> TokSequence:
-        if isinstance(input_seq, TokSequence):
-            return input_seq
-        tolist = getattr(input_seq, "tolist", None)  # numpy arrays, torch tensors
-        items: list[Any] = list(tolist() if callable(tolist) else input_seq)
-        if not items:
-            return TokSequence()
-        if isinstance(items[0], str):
-            return TokSequence(tokens=items)
-        if isinstance(items[0], Event):
-            return TokSequence(events=items)
-        ids = [int(i) for i in items]
-        return TokSequence(ids=ids, are_ids_encoded=self._are_ids_encoded(ids))
-
-    def _are_ids_encoded(self, ids: Sequence[int]) -> bool:
-        return self.is_trained and any(id_ >= len(self._vocab_base) for id_ in ids)
-
-    def tokens_errors(
-        self, tokens: TokSequence | Sequence[int] | Sequence[str] | Any
-    ) -> float:
-        """Ratio of tokens whose type cannot follow the previous one (0 = none)."""
-        seq = self._convert_sequence_to_tokseq(tokens)
-        if len(seq) == 0:
-            return 0.0
-        num_predicted = len(seq)
-        if seq.are_ids_encoded:
-            self.decode_token_ids(seq)
-        self.complete_sequence(seq)
-        return self._tokens_errors(seq.tokens) / num_predicted
-
-    def _tokens_errors(self, tokens: list[str]) -> int:
-        errors = 0
-        previous_type = tokens[0].split("_")[0]
-        if previous_type not in self.tokens_types_graph:
-            errors += 1
-        for token in tokens[1:]:
-            type_ = token.split("_")[0]
-            if type_ not in self.tokens_types_graph.get(previous_type, ()):
-                errors += 1
-            previous_type = type_
-        return errors
-
-    def save_tokens(
-        self, tokens: TokSequence | Sequence[int] | Any, path: str | Path, **kwargs: Any
-    ) -> None:
-        """Save token ids (only) as a JSON file, with any extra ``kwargs`` entries."""
-        seq = self._convert_sequence_to_tokseq(tokens)
-        self.complete_sequence(seq)
-        content = {"ids": seq.ids, "ids_encoded": seq.are_ids_encoded, **kwargs}
-        with Path(path).open("w") as file:
-            json.dump(content, file)
-
-    def load_tokens(
-        self, path: str | Path, raw: bool = False
-    ) -> TokSequence | dict[str, Any]:
-        """Load a JSON file written by :meth:`save_tokens`."""
-        with Path(path).open() as file:
-            content = json.load(file)
-        if raw:
-            return content
-        return TokSequence(
-            ids=content["ids"], are_ids_encoded=content.get("ids_encoded", False)
+    def _as_tokens(
+        self, sequence: TokSequence | Sequence[int] | Sequence[str]
+    ) -> list[str]:
+        if isinstance(sequence, TokSequence):
+            return list(sequence.tokens)
+        items: list[Any] = (
+            sequence.tolist() if hasattr(sequence, "tolist") else list(sequence)
         )
+        if items and isinstance(items[0], str):
+            return list(items)
+        return self.ids_to_tokens(int(id_) for id_ in items)
 
-    def tokenize_dataset(
+    # ----------------------------------------------------------------- BPE
+
+    def train_bpe(
         self,
-        files_paths: str | Path | Sequence[str | Path],
-        out_dir: str | Path,
-        overwrite_mode: bool = True,
-        validation_fn: Callable[[Score], bool] | None = None,
-        parallel_workers_size: int = max(1, (cpu_count() or 1) - 1),
+        sequences: Iterable[Sequence[str]],
+        vocab_size: int,
+        length: int | None = None,
+        show_progress: bool = False,
     ) -> None:
-        """Tokenize files (or a directory of them) into JSON files under ``out_dir``.
+        """Learn a BPE model from token sequences; ids become BPE ids.
 
-        The directory tree below the deepest common directory is reproduced, and
-        the tokenizer is saved as ``tokenizer.json`` in ``out_dir``. Files that
-        fail to load or that ``validation_fn`` rejects are skipped.
+        Example:
+            >>> files = sorted(Path("scores").glob("*.mxl"))
+            >>> tokenizer.train_bpe(
+            ...     (tokenizer.encode(f).tokens for f in files), vocab_size=10_000
+            ... )
+
+        Args:
+            sequences: Base token sequences, such as ``encode(f).tokens``.
+            vocab_size: The size of the BPE vocabulary.
+            length: The number of sequences, to display progress.
+            show_progress: Display a progress bar.
         """
-        out_dir = Path(out_dir).resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if isinstance(files_paths, str | Path):
-            root_dir = Path(files_paths).resolve()
-            paths = get_files_paths(root_dir)
-        else:
-            paths = [Path(p) for p in files_paths]
-            root_dir = deepest_common_dir(paths) if paths else out_dir
-        if not paths:
-            warnings.warn("No MusicXML file found to tokenize.", stacklevel=2)
-            return
-        fn = partial(
-            _tokenize_file,
-            self,
-            root_dir=root_dir,
-            out_dir=out_dir,
-            overwrite_mode=overwrite_mode,
-            validation_fn=validation_fn,
+        self.bpe = BPE.train(
+            sequences,
+            self._vocab,
+            self.config.special_tokens.as_list(),
+            vocab_size,
+            length=length,
+            show_progress=show_progress,
         )
-        if parallel_workers_size < 2 or len(paths) < 2:
-            for path in paths:
-                fn(path)
-        else:
-            with ProcessPoolExecutor(max_workers=parallel_workers_size) as executor:
-                list(
-                    executor.map(
-                        fn, paths, chunksize=max(1, len(paths) // parallel_workers_size)
-                    )
-                )
-        self.save(out_dir)
+
+    # --------------------------------------------------------- persistence
 
     def to_dict(self) -> dict[str, Any]:
-        """Serializable form: config, class name, versions and the trained model."""
-        from tokenizers import __version__ as tokenizers_version
-
+        """Return the tokenizer as a JSON-serializable dictionary."""
         from mxltok import __version__
 
-        params: dict[str, Any] = {
-            "config": self.config.to_dict(serialize=True),
-            "tokenization": self.__class__.__name__,
+        data: dict[str, Any] = {
+            "tokenizer_class": _TOKENIZER_CLASS,
             "mxltok_version": __version__,
-            "hf_tokenizers_version": tokenizers_version,
+            "vocab": self._vocab,
+            "config": self.config.to_dict(),
         }
-        if self._model is not None:
-            params["_vocab_base"] = self._vocab_base
-            params["_model"] = self._model.to_str()
-            params["_vocab_base_byte_to_token"] = self._vocab_base_byte_to_token
-        return params
+        if self.bpe is not None:
+            data["bpe"] = self.bpe.to_dict()
+        return data
 
-    def save(
-        self,
-        out_path: str | Path,
-        additional_attributes: dict[str, Any] | None = None,
-        filename: str = DEFAULT_TOKENIZER_FILE_NAME,
-    ) -> None:
-        """Save the tokenizer as JSON; ``out_path`` may be a directory."""
-        params = self.to_dict()
-        if additional_attributes:
-            params.update(additional_attributes)
-        out_path = Path(out_path)
-        if out_path.is_dir() or "." not in out_path.name:
-            out_path /= filename
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w") as file:
-            json.dump(params, file, indent=4)
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MXLTokenizer:
+        """Restore a tokenizer from :meth:`to_dict` output."""
+        tokenizer_class = data.get("tokenizer_class", _TOKENIZER_CLASS)
+        if tokenizer_class != _TOKENIZER_CLASS:
+            raise MxlTokError(f"Not an LMX tokenizer: {tokenizer_class!r}")
+        return cls(
+            TokenizerConfig.from_dict(data["config"]),
+            vocab=data["vocab"],
+            bpe=BPE.from_dict(data["bpe"]) if "bpe" in data else None,
+        )
 
-    def save_pretrained(
-        self,
-        save_directory: str | Path,
-        *,
-        repo_id: str | None = None,
-        push_to_hub: bool = False,
-        **push_to_hub_kwargs: Any,
-    ) -> str | None:
-        """Save into a directory, optionally pushing it to the Hugging Face Hub."""
-        save_directory = Path(save_directory)
-        save_directory.mkdir(parents=True, exist_ok=True)
-        self._save_pretrained(save_directory)
-        if push_to_hub:
-            push_to_hub_kwargs.pop("config", None)
-            push_to_hub_kwargs.pop("model_card_kwargs", None)
-            return self.push_to_hub(
-                repo_id=repo_id or save_directory.name, **push_to_hub_kwargs
-            )
-        return None
-
-    def _save_pretrained(self, save_directory: Path) -> None:
-        self.save(save_directory)
+    def save_pretrained(self, directory: str | Path) -> Path:
+        """Save the tokenizer as ``directory/tokenizer.json`` and return that path."""
+        path = Path(directory) / TOKENIZER_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.to_dict(), ensure_ascii=False), encoding="utf-8"
+        )
+        return path
 
     @classmethod
     def from_pretrained(
-        cls, pretrained_model_name_or_path: str | Path, **kwargs: Any
-    ) -> MusicTokenizer:
-        """Load a tokenizer from a JSON file, a directory, or a Hugging Face repo."""
-        path = Path(pretrained_model_name_or_path)
+        cls, name_or_path: str | Path, revision: str | None = None
+    ) -> MXLTokenizer:
+        """Load a saved tokenizer.
+
+        Args:
+            name_or_path: A ``tokenizer.json`` file or a directory holding one,
+                a dataset directory preprocessed by mxlGPT, or the id of a
+                Hugging Face Hub repository (requires ``mxltok[hub]``).
+            revision: The Hub revision (branch, tag or commit) to load.
+        """
+        path = Path(name_or_path)
         if path.is_file():
-            return cls._from_pretrained(
-                model_id=str(path),
-                revision=None,
-                cache_dir=None,
-                force_download=False,
-                local_files_only=True,
-                token=None,
-                **kwargs,
-            )
-        return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+            return cls.from_dict(_read_json(path))
+        if path.is_dir():
+            return cls._from_directory(path)
+        return cls.from_dict(_read_json(_hub_download(str(name_or_path), revision)))
 
     @classmethod
-    def _from_pretrained(
-        cls,
-        *,
-        model_id: str,
-        revision: str | None,
-        cache_dir: str | Path | None,
-        force_download: bool,
-        local_files_only: bool,
-        token: str | bool | None,
-        **kwargs: Any,
-    ) -> MusicTokenizer:
-        filename = kwargs.get("filename", DEFAULT_TOKENIZER_FILE_NAME)
-        pretrained_path = Path(model_id)
-        if pretrained_path.is_file():
-            params_path = pretrained_path
-        elif (pretrained_path / filename).is_file():
-            params_path = pretrained_path / filename
+    def _from_directory(cls, directory: Path) -> MXLTokenizer:
+        if (directory / "manifest.json").is_file():  # mxlGPT preprocessed dataset
+            directory = directory / "tokenizer"
+        if (directory / TOKENIZER_FILE).is_file():
+            data = _read_json(directory / TOKENIZER_FILE)
+        elif (directory / "vocab.json").is_file():  # mxlGPT multi-file format
+            data = {
+                "vocab": _read_json(directory / "vocab.json"),
+                "config": _read_json(directory / "config.json"),
+            }
         else:
-            params_path = Path(
-                hf_hub_download(
-                    repo_id=model_id,
-                    filename=filename,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    local_files_only=local_files_only,
-                    token=token,
-                    library_name="MxlTok",
-                )
-            )
-        with params_path.open() as file:
-            tokenization = json.load(file)["tokenization"]
-        if cls.__name__ == tokenization:
-            return cls(params=params_path)
-        if cls.__name__ != "MusicTokenizer":
-            warnings.warn(
-                f"{cls.__name__}.from_pretrained called on a {tokenization} tokenizer; "
-                f"returning a {tokenization}.",
-                stacklevel=2,
-            )
-        package = sys.modules[__name__.rsplit(".", 1)[0]]
-        return getattr(package, tokenization)(params=params_path)
+            raise MxlTokError(f"No tokenizer found in {directory}")
+        separate_bpe = directory / "bpe_tokenizer.json"
+        if "bpe" not in data and separate_bpe.is_file():
+            data["bpe"] = _read_json(separate_bpe)
+        return cls.from_dict(data)
 
-    def _load_from_json(self, file_path: str | Path) -> None:
-        with Path(file_path).open() as file:
-            params = json.load(file)
-        self.config = TokenizerConfig.from_dict(params["config"])
-        if "_vocab_base" in params:
-            self._vocab_base = params["_vocab_base"]
-            self._vocab_base_inv = {
-                id_: token for token, id_ in self._vocab_base.items()
-            }
-        if "_model" in params:
-            self._model = Tokenizer.from_str(params["_model"])
-        if "_vocab_base_byte_to_token" in params:
-            self._vocab_base_byte_to_token = params["_vocab_base_byte_to_token"]
-            token_to_byte = {t: b for b, t in self._vocab_base_byte_to_token.items()}
-            self._vocab_base_id_to_byte = {
-                id_: token_to_byte[token] for token, id_ in self._vocab_base.items()
-            }
-        if self._model is not None:
-            self._create_vocab_learned_bytes_to_tokens()
+    def push_to_hub(self, repo_id: str, private: bool = True, **kwargs: Any) -> str:
+        """Upload the tokenizer to a Hugging Face Hub repository (``mxltok[hub]``).
 
-    def __call__(
-        self,
-        obj: Score | str | Path | TokSequence | Sequence[int] | Sequence[str] | Any,
-        **kwargs: Any,
-    ) -> TokSequence | Score:
-        """Encode a score/file, or decode a sequence, depending on ``obj``."""
-        if isinstance(obj, Score):
-            return self.encode(obj, **kwargs)
-        if isinstance(obj, str | Path):
-            return self.encode(Path(obj), **kwargs)
-        return self.decode(obj, **kwargs)
+        Args:
+            repo_id: The repository, such as ``"user/mxltok-bpe10k"``.
+            private: Create the repository as private if it does not exist.
+            **kwargs: Passed to ``huggingface_hub.HfApi.upload_file``.
 
-    def __len__(self) -> int:
-        if self._model is not None:
-            return len(self._model.get_vocab())
-        return len(self._vocab_base)
-
-    def __getitem__(self, item: int | str) -> str | int:
-        """Token of an id, or id of a token."""
-        if isinstance(item, str):
-            return self._vocab_base[item]
-        return self._vocab_base_inv[item]
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, MusicTokenizer):
-            return False
-        return (
-            self._vocab_base == other._vocab_base
-            and self.vocab_model == other.vocab_model
-            and self._vocab_base_byte_to_token == other._vocab_base_byte_to_token
-            and self.config == other.config
+        Returns:
+            The URL of the uploaded commit.
+        """
+        hub = _import_hub()
+        api = hub.HfApi()
+        api.create_repo(repo_id, private=private, exist_ok=True)
+        content = json.dumps(self.to_dict(), ensure_ascii=False).encode("utf-8")
+        commit = api.upload_file(
+            path_or_fileobj=content,
+            path_in_repo=TOKENIZER_FILE,
+            repo_id=repo_id,
+            **kwargs,
         )
-
-    def __repr__(self) -> str:
-        trained = f", trained ({len(self)} tokens)" if self.is_trained else ""
-        return (
-            f"{self.__class__.__name__}({len(self._vocab_base)} base tokens{trained})"
-        )
+        return str(commit)
 
 
-def _tokenize_file(
-    tokenizer: MusicTokenizer,
-    file_path: Path,
-    root_dir: Path,
-    out_dir: Path,
-    overwrite_mode: bool,
-    validation_fn: Callable[[Score], bool] | None,
-) -> None:
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _import_hub() -> Any:
     try:
-        score = load(file_path)
-    except Exception as exc:
-        warnings.warn(f"Skipping {file_path}: {exc}", stacklevel=2)
-        return
-    if validation_fn is not None and not validation_fn(score):
-        return
-    out_path = out_dir / file_path.resolve().parent.relative_to(root_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    out_path /= f"{file_path.stem}.json"
-    if not overwrite_mode:
-        index = 1
-        while out_path.is_file():
-            out_path = out_path.parent / f"{file_path.stem}_{index}.json"
-            index += 1
-    tokenizer.save_tokens(tokenizer.encode(score), out_path)
+        import huggingface_hub
+    except ImportError as exc:
+        raise ImportError(
+            "Hugging Face Hub support requires: pip install 'mxltok[hub]'"
+        ) from exc
+    return huggingface_hub
+
+
+def _hub_download(repo_id: str, revision: str | None) -> Path:
+    hub = _import_hub()
+    return Path(hub.hf_hub_download(repo_id, TOKENIZER_FILE, revision=revision))
