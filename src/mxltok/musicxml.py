@@ -1,4 +1,4 @@
-"""MusicXML (``.musicxml``/``.xml``/``.mxl``) reading and writing for :mod:`score`."""
+"""Read and write MusicXML (``.musicxml``, ``.xml`` and compressed ``.mxl``)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import zipfile
 from fractions import Fraction
 from pathlib import Path
 
-from mxltok.classes import MxlTokError
+from mxltok.errors import MxlTokError
 from mxltok.score import (
     Attributes,
     Backup,
@@ -24,23 +24,6 @@ from mxltok.score import (
     Score,
 )
 
-_ORNAMENT_TAGS = frozenset(
-    {
-        "trill-mark",
-        "turn",
-        "delayed-turn",
-        "inverted-turn",
-        "delayed-inverted-turn",
-        "vertical-turn",
-        "inverted-vertical-turn",
-        "shake",
-        "mordent",
-        "inverted-mordent",
-        "schleifer",
-        "tremolo",
-        "haydn",
-    }
-)
 _XML_HEADER = (
     '<?xml version="1.0" encoding="UTF-8"?>\n'
     '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
@@ -53,22 +36,35 @@ _CONTAINER_XML = (
 )
 
 
-def load(source: str | Path | bytes | ET.Element) -> Score:
-    """Parse a MusicXML file, its bytes, or an already-parsed root element."""
-    if isinstance(source, ET.Element):
-        root = source
-    elif isinstance(source, bytes):
-        root = ET.fromstring(source)
-    else:
-        path = Path(source)
-        if path.suffix.lower() == ".mxl":
-            root = ET.fromstring(_read_mxl(path))
+# --------------------------------------------------------------------------- #
+# Reading
+# --------------------------------------------------------------------------- #
+
+
+def read_musicxml(source: str | Path | bytes | ET.Element) -> Score:
+    """Read a score from a MusicXML file, its bytes or a parsed root element.
+
+    Raises:
+        MxlTokError: If the file is not valid MusicXML.
+    """
+    try:
+        if isinstance(source, ET.Element):
+            root = source
+        elif isinstance(source, bytes):
+            root = ET.fromstring(source)
         else:
-            root = ET.parse(path).getroot()
+            path = Path(source)
+            if path.suffix.lower() == ".mxl":
+                root = ET.fromstring(_read_mxl(path))
+            else:
+                root = ET.parse(path).getroot()
+    except (ET.ParseError, zipfile.BadZipFile) as exc:
+        raise MxlTokError(f"Cannot parse {source!r}: {exc}") from exc
     return _parse_score(root)
 
 
 def _read_mxl(path: Path) -> bytes:
+    """Return the MusicXML document inside a compressed ``.mxl`` file."""
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
         inner = None
@@ -77,12 +73,12 @@ def _read_mxl(path: Path) -> bytes:
             rootfile = container.find(".//rootfile")
             if rootfile is not None:
                 inner = rootfile.get("full-path")
-        if inner is None or inner not in names:
+        if inner not in names:
             candidates = [
-                n
-                for n in names
-                if not n.startswith("META-INF")
-                and n.lower().endswith((".xml", ".musicxml"))
+                name
+                for name in names
+                if not name.startswith("META-INF")
+                and name.lower().endswith((".xml", ".musicxml"))
             ]
             if not candidates:
                 raise MxlTokError(f"No MusicXML document found inside {path}")
@@ -95,206 +91,196 @@ def _parse_score(root: ET.Element) -> Score:
         root = _timewise_to_partwise(root)
     if root.tag != "score-partwise":
         raise MxlTokError(f"Unsupported MusicXML root element <{root.tag}>")
-    score_parts = {sp.get("id"): sp for sp in root.iterfind("part-list/score-part")}
-    parts: list[Part] = []
+    score_parts: dict[str, ET.Element] = {}
+    for entry in root.iterfind("part-list/score-part"):
+        score_parts.setdefault(entry.get("id", ""), entry)
+    parts = []
     for part_el in root.iterfind("part"):
-        part_id = part_el.get("id") or f"P{len(parts) + 1}"
-        part = Part(id=part_id)
-        score_part = score_parts.get(part_id)
+        part = Part(id=part_el.get("id", ""))
+        score_part = score_parts.get(part.id)
         if score_part is not None:
-            part.name = (score_part.findtext("part-name") or "").strip()
-            part.midi_program = _int_text(
-                score_part.find("midi-instrument/midi-program")
-            )
-            part.midi_channel = _int_text(
-                score_part.find("midi-instrument/midi-channel")
-            )
+            part.name = score_part.findtext("part-name") or ""
+            midi = score_part.find(".//midi-instrument")
+            if midi is not None:
+                part.midi_channel = _int(midi.findtext("midi-channel"))
+                part.midi_program = _int(midi.findtext("midi-program"))
         part.measures = _parse_measures(part_el)
         parts.append(part)
-    return Score(parts=parts)
+    return Score(parts)
 
 
 def _timewise_to_partwise(root: ET.Element) -> ET.Element:
     partwise = ET.Element("score-partwise", root.attrib)
-    for child in root:
-        if child.tag != "measure":
-            partwise.append(child)
-    part_elements: dict[str, ET.Element] = {}
+    partwise.extend(child for child in root if child.tag != "measure")
+    parts: dict[str, ET.Element] = {}
     for measure in root.iterfind("measure"):
         for part in measure.iterfind("part"):
             part_id = part.get("id", "")
-            if part_id not in part_elements:
-                part_elements[part_id] = ET.SubElement(
-                    partwise, "part", {"id": part_id}
-                )
-            new_measure = ET.SubElement(
-                part_elements[part_id], "measure", measure.attrib
-            )
-            new_measure.extend(list(part))
+            if part_id not in parts:
+                parts[part_id] = ET.SubElement(partwise, "part", {"id": part_id})
+            ET.SubElement(parts[part_id], "measure", measure.attrib).extend(part)
     return partwise
 
 
 def _parse_measures(part_el: ET.Element) -> list[Measure]:
-    divisions = 1
-    measures: list[Measure] = []
+    divisions: int | None = None  # unknown until the first <divisions>
+    measures = []
     for measure_el in part_el.iterfind("measure"):
         elements: list[Element] = []
         for el in measure_el:
-            match el.tag:
-                case "attributes":
-                    attributes, new_divisions = _parse_attributes(el)
-                    divisions = new_divisions or divisions
-                    if attributes is not None:
-                        elements.append(attributes)
-                case "note":
-                    elements.append(_parse_note(el, divisions))
-                case "backup":
-                    elements.append(Backup(_parse_duration(el, divisions)))
-                case "forward":
-                    elements.append(Forward(_parse_duration(el, divisions)))
-                case "direction":
-                    elements.extend(_parse_direction(el))
-                case "sound":
-                    elements.extend(_parse_sound(el))
-                case "harmony":
-                    harmony = _parse_harmony(el)
-                    if harmony is not None:
-                        elements.append(harmony)
-                case "barline":
-                    barline = _parse_barline(el)
-                    if barline is not None:
-                        elements.append(barline)
+            if el.tag == "attributes":
+                divisions = _int(el.findtext("divisions")) or divisions
+                attributes = _parse_attributes(el)
+                if attributes is not None:
+                    elements.append(attributes)
+            elif el.tag == "note":
+                elements.append(_parse_note(el, divisions))
+            elif el.tag in ("backup", "forward"):
+                # Without <divisions> a cursor move cannot be placed in time.
+                duration = _duration(el, divisions)
+                if duration is not None:
+                    move = Backup if el.tag == "backup" else Forward
+                    elements.append(move(duration))
+            elif el.tag == "direction":
+                elements.extend(_parse_direction(el))
+            elif el.tag == "sound":
+                elements.extend(_parse_sound(el))
+            elif el.tag == "harmony":
+                harmony = _parse_harmony(el)
+                if harmony is not None:
+                    elements.append(harmony)
+            elif el.tag == "barline":
+                barline = _parse_barline(el)
+                if barline is not None:
+                    elements.append(barline)
         measures.append(Measure(elements))
     return measures
 
 
-def _parse_attributes(el: ET.Element) -> tuple[Attributes | None, int | None]:
-    divisions = _int_text(el.find("divisions"))
-    time: tuple[int, int] | None = None
-    beats, beat_type = el.findtext("time/beats"), el.findtext("time/beat-type")
+def _parse_attributes(el: ET.Element) -> Attributes | None:
+    beats, beat_type = el.find("time/beats"), el.find("time/beat-type")
+    time = None
     if beats is not None and beat_type is not None:
-        time = (_int(beats, "time/beats"), _int(beat_type, "time/beat-type"))
+        time = (
+            _strict_int(beats.text, "beats"),
+            _strict_int(beat_type.text, "beat-type"),
+        )
     clefs = [
         Clef(
-            sign=(clef.findtext("sign") or "G").strip(),
-            line=_int_text(clef.find("line")),
-            number=int(clef.get("number", "1")),
+            sign=clef.findtext("sign") or None,
+            line=_int(clef.findtext("line")),
+            number=_strict_int(clef.get("number", "1"), "clef number"),
         )
         for clef in el.iterfind("clef")
     ]
+    key = el.find("key/fifths")
+    staves = el.find("staves")
     attributes = Attributes(
-        key=_int_text(el.find("key/fifths")),
+        key=None if key is None else _strict_int(key.text, "fifths"),
         time=time,
-        staves=_int_text(el.find("staves")),
+        staves=None if staves is None else _strict_int(staves.text, "staves"),
         clefs=clefs,
     )
-    if attributes == Attributes():
-        return None, divisions
-    return attributes, divisions
+    return None if attributes == Attributes() else attributes
 
 
-def _parse_duration(el: ET.Element, divisions: int) -> Fraction:
+def _duration(el: ET.Element, divisions: int | None) -> Fraction | None:
     text = el.findtext("duration")
-    if text is None:
-        return Fraction(0)
-    return Fraction(_int(text, "duration"), divisions)
+    if text is None or not divisions:
+        return None
+    try:
+        return Fraction(text.strip()) / divisions
+    except ValueError as exc:
+        raise MxlTokError(f"Invalid <duration>: {text!r}") from exc
 
 
-def _parse_note(el: ET.Element, divisions: int) -> Note:
-    note = Note(duration=_parse_duration(el, divisions))
+def _parse_note(el: ET.Element, divisions: int | None) -> Note:
+    note = Note(duration=_duration(el, divisions) or Fraction(0))
     grace = el.find("grace")
     if grace is not None:
         note.grace = True
         note.grace_slash = grace.get("slash") == "yes"
     note.chord = el.find("chord") is not None
-    rest = el.find("rest")
-    pitch = el.find("pitch")
-    unpitched = el.find("unpitched")
+    rest, pitch, unpitched = el.find("rest"), el.find("pitch"), el.find("unpitched")
     if rest is not None:
         note.rest = True
-        note.rest_measure = rest.get("measure") == "yes"
+        note.measure_rest = rest.get("measure") == "yes"
     elif pitch is not None:
         note.step = pitch.findtext("step")
-        note.octave = _int_text(pitch.find("octave"))
-        note.alter = float(pitch.findtext("alter") or 0)
-    elif unpitched is not None:
+        note.octave = _int(pitch.findtext("octave"))
+        note.alter = _float(pitch.findtext("alter"))
+    else:
         note.unpitched = True
-        note.step = unpitched.findtext("display-step")
-        note.octave = _int_text(unpitched.find("display-octave"))
+        if unpitched is not None:
+            note.step = unpitched.findtext("display-step")
+            note.octave = _int(unpitched.findtext("display-octave"))
     note.type_ = el.findtext("type")
     note.dots = len(el.findall("dot"))
-    note.accidental = el.findtext("accidental")
-    note.voice = _int_text(el.find("voice"))
-    note.staff = _int_text(el.find("staff"))
+    note.accidental = el.findtext("accidental") or None
+    note.voice = _int(el.findtext("voice"), strict=True)
+    note.staff = _int(el.findtext("staff"), strict=True)
     note.stem = el.findtext("stem")
     note.print_object = el.get("print-object") != "no"
-    time_mod = el.find("time-modification")
-    if time_mod is not None:
-        note.time_mod = (
-            _int(time_mod.findtext("actual-notes") or "1", "actual-notes"),
-            _int(time_mod.findtext("normal-notes") or "1", "normal-notes"),
+    actual = el.findtext("time-modification/actual-notes")
+    normal = el.findtext("time-modification/normal-notes")
+    if actual and normal:
+        note.time_modification = (
+            _strict_int(actual, "actual-notes"),
+            _strict_int(normal, "normal-notes"),
         )
-    note.ties = tuple(t for tie in el.iterfind("tie") if (t := tie.get("type")))
-    beams = sorted(el.iterfind("beam"), key=lambda b: int(b.get("number", "1")))
-    note.beams = tuple((beam.text or "").strip() for beam in beams)
+    ties = [tie_type for tie in el.iterfind("tie") if (tie_type := tie.get("type"))]
+    note.beams = tuple(beam.text for beam in el.iterfind("beam") if beam.text)
     notations = el.find("notations")
     if notations is not None:
+        for tied in notations.iterfind("tied"):
+            tied_type = tied.get("type")
+            if tied_type and tied_type not in ties:
+                ties.append(tied_type)
         _parse_notations(notations, note)
+    note.ties = tuple(ties)
     return note
 
 
 def _parse_notations(notations: ET.Element, note: Note) -> None:
-    if not note.ties:
-        note.ties = tuple(
-            t for tied in notations.iterfind("tied") if (t := tied.get("type"))
-        )
     note.slurs = tuple(
-        t
+        slur_type
         for slur in notations.iterfind("slur")
-        if (t := slur.get("type")) and t != "continue"
+        if (slur_type := slur.get("type")) and slur_type != "continue"
     )
     note.tuplets = tuple(
-        t for tup in notations.iterfind("tuplet") if (t := tup.get("type"))
+        tuplet_type
+        for tuplet in notations.iterfind("tuplet")
+        if (tuplet_type := tuplet.get("type"))
     )
-    note.articulations = tuple(
-        child.tag for group in notations.iterfind("articulations") for child in group
+    articulations = notations.find("articulations")
+    if articulations is not None:
+        note.articulations = tuple(child.tag for child in articulations)
+    ornaments = notations.find("ornaments")
+    if ornaments is not None:
+        note.ornaments = tuple(child.tag for child in ornaments)
+        tremolo = ornaments.find("tremolo")
+        if tremolo is not None:
+            note.tremolo = (tremolo.get("type", "single"), tremolo.text or "3")
+    note.fermata = notations.find("fermata") is not None
+    note.arpeggiate = notations.find("arpeggiate") is not None
+    note.glissandos = tuple(
+        glissando_type
+        for glissando in notations.iterfind("glissando")
+        if (glissando_type := glissando.get("type"))
     )
-    ornaments: list[str] = []
-    for group in notations.iterfind("ornaments"):
-        for child in group:
-            if child.tag == "tremolo":
-                ornaments.append(
-                    f"tremolo:{child.get('type', 'single')}:{child.text or '3'}"
-                )
-            elif child.tag in _ORNAMENT_TAGS:
-                ornaments.append(child.tag)
-    note.ornaments = tuple(ornaments)
-    extra: list[str] = []
-    for child in notations:
-        if child.tag in {"fermata", "arpeggiate"}:
-            extra.append(child.tag)
-        elif child.tag == "glissando" and child.get("type") in {"start", "stop"}:
-            extra.append(f"glissando-{child.get('type')}")
-    note.notations = tuple(extra)
 
 
 def _parse_direction(el: ET.Element) -> list[Direction]:
-    directions: list[Direction] = []
+    sound = el.find("sound")
+    directions = _parse_sound(sound) if sound is not None else []
     for direction_type in el.iterfind("direction-type"):
-        for dynamics in direction_type.iterfind("dynamics"):
-            directions.extend(
-                Direction("dynamics", child.tag)
-                for child in dynamics
-                if child.tag != "other-dynamics"
-            )
-        for wedge in direction_type.iterfind("wedge"):
-            if wedge.get("type") in {"crescendo", "diminuendo", "stop"}:
-                directions.append(Direction("wedge", wedge.get("type", "")))
-        for pedal in direction_type.iterfind("pedal"):
-            if pedal.get("type") in {"start", "stop", "change"}:
-                directions.append(Direction("pedal", pedal.get("type", "")))
-    for sound in el.iterfind("sound"):
-        directions.extend(_parse_sound(sound))
+        dynamics = direction_type.find("dynamics")
+        if dynamics is not None:
+            directions += [Direction("dynamics", child.tag) for child in dynamics]
+        for kind in ("wedge", "pedal"):
+            marking = direction_type.find(kind)
+            if marking is not None and (value := marking.get("type")):
+                directions.append(Direction(kind, value))
     return directions
 
 
@@ -302,20 +288,30 @@ def _parse_sound(el: ET.Element) -> list[Direction]:
     tempo = el.get("tempo")
     if tempo is None:
         return []
-    return [Direction("tempo", str(round(float(tempo))))]
+    try:
+        return [Direction("tempo", str(round(float(tempo))))]
+    except (ValueError, OverflowError) as exc:
+        raise MxlTokError(f"Invalid tempo: {tempo!r}") from exc
 
 
 def _parse_harmony(el: ET.Element) -> Harmony | None:
-    root_step = el.findtext("root/root-step")
-    if root_step is None:
+    root = el.findtext("root/root-step")
+    if root is None:
         return None
+    bass = el.findtext("bass/bass-step")
     return Harmony(
-        root=root_step.strip(),
-        root_alter=round(float(el.findtext("root/root-alter") or 0)),
-        kind=(el.findtext("kind") or "major").strip() or "major",
-        bass=(el.findtext("bass/bass-step") or "").strip() or None,
-        bass_alter=round(float(el.findtext("bass/bass-alter") or 0)),
+        root=root.strip(),
+        root_alter=_harmony_alter(el.findtext("root/root-alter")),
+        kind=(el.findtext("kind") or "").strip() or "major",
+        bass=bass.strip() if bass is not None else None,
+        bass_alter=_harmony_alter(el.findtext("bass/bass-alter")),
     )
+
+
+def _harmony_alter(text: str | None) -> int:
+    """Return a chord symbol alteration; non-integer alterations are dropped."""
+    alter = _float(text)
+    return int(alter) if alter.is_integer() else 0
 
 
 def _parse_barline(el: ET.Element) -> Barline | None:
@@ -323,28 +319,51 @@ def _parse_barline(el: ET.Element) -> Barline | None:
     barline = Barline(
         location=el.get("location", "right"),
         repeat=repeat.get("direction") if repeat is not None else None,
-        style=(el.findtext("bar-style") or "").strip() or None,
+        style=el.findtext("bar-style") or None,
     )
     if barline.repeat is None and barline.style is None:
         return None
     return barline
 
 
-def _int(text: str, what: str) -> int:
+def _strict_int(text: str | None, what: str) -> int:
     try:
-        return int(text.strip())
+        return int((text or "").strip())
     except ValueError as exc:
         raise MxlTokError(f"Invalid integer for <{what}>: {text!r}") from exc
 
 
-def _int_text(el: ET.Element | None) -> int | None:
-    if el is None or el.text is None or not el.text.strip():
+def _int(text: str | None, strict: bool = False) -> int | None:
+    """Parse an optional integer; invalid values raise only when ``strict``."""
+    if text is None or not text.strip():
         return None
-    return _int(el.text, el.tag)
+    try:
+        return int(text.strip())
+    except ValueError as exc:
+        if strict:
+            raise MxlTokError(f"Invalid integer: {text!r}") from exc
+        return None
 
 
-def dump(score: Score, path: str | Path | None = None) -> str:
-    """Serialize ``score`` to MusicXML. Writes ``path`` too (``.mxl`` = zipped)."""
+def _float(text: str | None) -> float:
+    try:
+        return float(text) if text else 0.0
+    except ValueError:
+        return 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Writing
+# --------------------------------------------------------------------------- #
+
+
+def write_musicxml(score: Score, path: str | Path | None = None) -> str:
+    """Serialize a score to MusicXML and return the document.
+
+    Args:
+        score: The score to write.
+        path: Also write the document there; a ``.mxl`` path is compressed.
+    """
     root = _write_score(score)
     ET.indent(root)
     text = _XML_HEADER + ET.tostring(root, encoding="unicode") + "\n"
@@ -376,8 +395,7 @@ def _write_score(score: Score) -> ET.Element:
                 ET.SubElement(midi, "midi-channel").text = str(part.midi_channel)
             if part.midi_program is not None:
                 ET.SubElement(midi, "midi-program").text = str(part.midi_program)
-    for part in score.parts:
-        root.append(_write_part(part))
+    root.extend(_write_part(part) for part in score.parts)
     return root
 
 
@@ -387,46 +405,30 @@ def _write_part(part: Part) -> ET.Element:
     open_slurs = 0
     for number, measure in enumerate(part.measures, start=1):
         measure_el = ET.SubElement(part_el, "measure", {"number": str(number)})
-        divisions_pending = number == 1
         for element in measure.elements:
-            match element:
-                case Attributes():
-                    attributes_el = _write_attributes(element)
-                    if divisions_pending:
-                        _insert_divisions(attributes_el, divisions)
-                        divisions_pending = False
-                    measure_el.append(attributes_el)
-                case Note():
-                    if divisions_pending:
-                        _insert_divisions(
-                            ET.SubElement(measure_el, "attributes"), divisions
-                        )
-                        divisions_pending = False
-                    note_el, open_slurs = _write_note(element, divisions, open_slurs)
-                    measure_el.append(note_el)
-                case Backup() | Forward():
-                    if divisions_pending:
-                        _insert_divisions(
-                            ET.SubElement(measure_el, "attributes"), divisions
-                        )
-                        divisions_pending = False
-                    tag = "backup" if isinstance(element, Backup) else "forward"
-                    el = ET.SubElement(measure_el, tag)
-                    ET.SubElement(el, "duration").text = _duration_text(
-                        element.duration, divisions
-                    )
-                case Direction():
-                    measure_el.append(_write_direction(element))
-                case Harmony():
-                    measure_el.append(_write_harmony(element))
-                case Barline():
-                    measure_el.append(_write_barline(element))
-        if divisions_pending:
-            _insert_divisions(ET.SubElement(measure_el, "attributes"), divisions)
+            if isinstance(element, Attributes):
+                measure_el.append(_write_attributes(element))
+            elif isinstance(element, Note):
+                note_el, open_slurs = _write_note(element, divisions, open_slurs)
+                measure_el.append(note_el)
+            elif isinstance(element, Backup | Forward):
+                tag = "backup" if isinstance(element, Backup) else "forward"
+                ET.SubElement(
+                    ET.SubElement(measure_el, tag), "duration"
+                ).text = _duration_text(element.duration, divisions)
+            elif isinstance(element, Direction):
+                measure_el.append(_write_direction(element))
+            elif isinstance(element, Harmony):
+                measure_el.append(_write_harmony(element))
+            elif isinstance(element, Barline):
+                measure_el.append(_write_barline(element))
+    if len(part_el):
+        _insert_divisions(part_el[0], divisions)
     return part_el
 
 
 def _divisions(part: Part) -> int:
+    """Return the smallest ``<divisions>`` expressing every duration exactly."""
     divisions = 1
     for measure in part.measures:
         for element in measure.elements:
@@ -439,10 +441,24 @@ def _duration_text(duration: Fraction, divisions: int) -> str:
     return str(int(duration * divisions))
 
 
-def _insert_divisions(attributes_el: ET.Element, divisions: int) -> None:
-    el = ET.Element("divisions")
-    el.text = str(divisions)
-    attributes_el.insert(0, el)
+def _insert_divisions(measure_el: ET.Element, divisions: int) -> None:
+    """Add ``<divisions>`` to the head ``<attributes>`` of the first measure."""
+    position = next(
+        (
+            i
+            for i, child in enumerate(measure_el)
+            if child.tag not in ("print", "barline")
+        ),
+        len(measure_el),
+    )
+    if position < len(measure_el) and measure_el[position].tag == "attributes":
+        attributes_el = measure_el[position]
+    else:
+        attributes_el = ET.Element("attributes")
+        measure_el.insert(position, attributes_el)
+    divisions_el = ET.Element("divisions")
+    divisions_el.text = str(divisions)
+    attributes_el.insert(0, divisions_el)
 
 
 def _write_attributes(attributes: Attributes) -> ET.Element:
@@ -468,19 +484,16 @@ def _write_note(note: Note, divisions: int, open_slurs: int) -> tuple[ET.Element
     if not note.print_object:
         el.set("print-object", "no")
     if note.grace:
-        grace = ET.SubElement(el, "grace")
-        if note.grace_slash:
-            grace.set("slash", "yes")
+        ET.SubElement(el, "grace", {"slash": "yes"} if note.grace_slash else {})
     if note.chord:
         ET.SubElement(el, "chord")
     if note.rest:
-        rest = ET.SubElement(el, "rest")
-        if note.rest_measure:
-            rest.set("measure", "yes")
+        ET.SubElement(el, "rest", {"measure": "yes"} if note.measure_rest else {})
     elif note.unpitched:
         unpitched = ET.SubElement(el, "unpitched")
-        ET.SubElement(unpitched, "display-step").text = note.step
-        ET.SubElement(unpitched, "display-octave").text = str(note.octave)
+        if note.step is not None:
+            ET.SubElement(unpitched, "display-step").text = note.step
+            ET.SubElement(unpitched, "display-octave").text = str(note.octave)
     else:
         pitch = ET.SubElement(el, "pitch")
         ET.SubElement(pitch, "step").text = note.step
@@ -499,10 +512,11 @@ def _write_note(note: Note, divisions: int, open_slurs: int) -> tuple[ET.Element
         ET.SubElement(el, "dot")
     if note.accidental is not None:
         ET.SubElement(el, "accidental").text = note.accidental
-    if note.time_mod is not None:
+    if note.time_modification is not None:
         time_mod = ET.SubElement(el, "time-modification")
-        ET.SubElement(time_mod, "actual-notes").text = str(note.time_mod[0])
-        ET.SubElement(time_mod, "normal-notes").text = str(note.time_mod[1])
+        actual, normal = note.time_modification
+        ET.SubElement(time_mod, "actual-notes").text = str(actual)
+        ET.SubElement(time_mod, "normal-notes").text = str(normal)
     if note.stem is not None:
         ET.SubElement(el, "stem").text = note.stem
     if note.staff is not None:
@@ -519,22 +533,19 @@ def _write_notations(note: Note, open_slurs: int) -> tuple[ET.Element, int]:
     el = ET.Element("notations")
     for tie in note.ties:
         ET.SubElement(el, "tied", {"type": tie})
-    for slur in note.slurs:
-        if slur == "start":
-            open_slurs += 1
-            ET.SubElement(el, "slur", {"type": slur, "number": str(open_slurs)})
-        else:
-            ET.SubElement(el, "slur", {"type": slur, "number": str(max(open_slurs, 1))})
-            open_slurs = max(open_slurs - 1, 0)
     for tuplet in note.tuplets:
         ET.SubElement(el, "tuplet", {"type": tuplet})
-    for notation in note.notations:
-        if notation.startswith("glissando-"):
-            ET.SubElement(
-                el, "glissando", {"type": notation.removeprefix("glissando-")}
-            )
-        else:
-            ET.SubElement(el, notation)
+    for slur in note.slurs:
+        attributes = {"type": slur}
+        if slur == "start":
+            open_slurs += 1
+            attributes["number"] = str(open_slurs)
+        elif open_slurs > 0:
+            attributes["number"] = str(open_slurs)
+            open_slurs -= 1
+        ET.SubElement(el, "slur", attributes)
+    if note.fermata:
+        ET.SubElement(el, "fermata")
     if note.articulations:
         group = ET.SubElement(el, "articulations")
         for articulation in note.articulations:
@@ -542,29 +553,30 @@ def _write_notations(note: Note, open_slurs: int) -> tuple[ET.Element, int]:
     if note.ornaments:
         group = ET.SubElement(el, "ornaments")
         for ornament in note.ornaments:
-            if ornament.startswith("tremolo:"):
-                _, kind, marks = ornament.split(":")
-                ET.SubElement(group, "tremolo", {"type": kind}).text = marks
+            if ornament == "tremolo" and note.tremolo is not None:
+                tremolo_type, marks = note.tremolo
+                ET.SubElement(group, "tremolo", {"type": tremolo_type}).text = marks
             else:
                 ET.SubElement(group, ornament)
+    if note.arpeggiate:
+        ET.SubElement(el, "arpeggiate")
+    for glissando in note.glissandos:
+        ET.SubElement(el, "glissando", {"type": glissando})
     return el, open_slurs
 
 
 def _write_direction(direction: Direction) -> ET.Element:
     el = ET.Element("direction")
     direction_type = ET.SubElement(el, "direction-type")
-    match direction.kind:
-        case "dynamics":
-            ET.SubElement(ET.SubElement(direction_type, "dynamics"), direction.value)
-        case "wedge":
-            ET.SubElement(direction_type, "wedge", {"type": direction.value})
-        case "pedal":
-            ET.SubElement(direction_type, "pedal", {"type": direction.value})
-        case "tempo":
-            metronome = ET.SubElement(direction_type, "metronome")
-            ET.SubElement(metronome, "beat-unit").text = "quarter"
-            ET.SubElement(metronome, "per-minute").text = direction.value
-            ET.SubElement(el, "sound", {"tempo": direction.value})
+    if direction.kind == "dynamics":
+        ET.SubElement(ET.SubElement(direction_type, "dynamics"), direction.value)
+    elif direction.kind == "tempo":
+        metronome = ET.SubElement(direction_type, "metronome")
+        ET.SubElement(metronome, "beat-unit").text = "quarter"
+        ET.SubElement(metronome, "per-minute").text = direction.value
+        ET.SubElement(el, "sound", {"tempo": direction.value})
+    else:  # wedge or pedal
+        ET.SubElement(direction_type, direction.kind, {"type": direction.value})
     return el
 
 
