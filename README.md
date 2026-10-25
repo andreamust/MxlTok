@@ -4,6 +4,17 @@ MxlTok tokenizes **MusicXML** scores into **LMX** (Linearized MusicXML) token
 sequences for language models, and decodes token sequences back into
 MusicXML.
 
+This is the official tokenizer of the ISMIR 2026 paper
+[*Does Notation Matter? MusicXML Tokenisation for Symbolic Music Generation
+and Understanding*](https://ismir2026program.ismir.net/poster_371.html)
+(Poltronieri, Spanio, Chieppa, Serra and Rocamora). The paper introduces this
+tokenisation framework for MusicXML and compares it with MIDI- and ABC-based
+representations across 26 autoregressive and masked language models, on music
+understanding (composer classification, difficulty estimation, accompaniment
+suggestion) and generation (objective metrics and a human preference study).
+MusicXML-tokenised models outperform their MIDI and text-based counterparts
+on both. If you use MxlTok, please [cite the paper](#citation).
+
 ```
 <BOS> num_parts:1 part:instrument:Piano part:start part:instrument:Piano
 measure key:fifths:-3 time:num:4 time:den:4 clef:G2 dynamics:p
@@ -144,6 +155,20 @@ uv build                 # build the wheel and the source distribution
 The tests compare MxlTok with reference outputs of mxlGPT's tokenizer, stored
 under `tests/fixtures`. `scripts/mxlgpt_parity.py` regenerates them and
 compares both tokenizers on any corpus of MusicXML files.
+
+## Citation
+
+```bibtex
+@inproceedings{poltronieri2026notation,
+  title     = {Does Notation Matter? {MusicXML} Tokenisation for Symbolic Music
+               Generation and Understanding},
+  author    = {Poltronieri, Andrea and Spanio, Matteo and Chieppa, Simone and
+               Serra, Xavier and Rocamora, Mart{\'i}n},
+  booktitle = {Proceedings of the 27th International Society for Music
+               Information Retrieval Conference (ISMIR)},
+  year      = {2026}
+}
+```
 
 ## License
 
