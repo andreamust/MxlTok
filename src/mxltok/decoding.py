@@ -1,27 +1,29 @@
-"""Tokens -> score IR, one part at a time."""
+"""Decode the LMX tokens of one part back into :class:`~mxltok.score.Measure` s.
+
+Decoding mirrors :mod:`mxltok.encoding`. The tokens of a measure are grouped
+around their *root* token (a note type, a signature, a direction or a chord
+symbol), with the prefix tokens before it and the suffix tokens after it.
+Each group then becomes a score element. Model-generated sequences need not
+be well formed: malformed groups are skipped with a warning, or raise
+:class:`~mxltok.errors.MxlTokError` in strict mode.
+"""
 
 from __future__ import annotations
 
+import re
 import warnings
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import cast
 
-from mxltok.classes import MxlTokError, TokenizerConfig
-from mxltok.constants import (
-    ACCIDENTAL_ALTER,
-    NOTE_TYPE_QUARTERS,
-    NOTE_TYPES,
-    PITCH_STEPS,
-    SUFFIX_TO_ACCIDENTAL,
-)
+from mxltok.errors import MxlTokError
+from mxltok.intervals import interval_to_absolute, split_pitch_token
 from mxltok.score import (
     Attributes,
     Backup,
     Barline,
     Clef,
     Direction,
-    DirectionKind,
     Element,
     Forward,
     Harmony,
@@ -30,387 +32,576 @@ from mxltok.score import (
     Part,
     resolve_alters,
 )
+from mxltok.vocabulary import (
+    BACKUP,
+    BEAM_TOKENS,
+    CLEF_TOKENS,
+    DYNAMICS_TOKENS,
+    FORWARD,
+    GLISSANDO_TOKENS,
+    HARMONY_BASS_TOKENS,
+    HARMONY_EXT_TOKENS,
+    HARMONY_KINDS,
+    HARMONY_QUALITY_TOKENS,
+    HARMONY_ROOT_TOKENS,
+    INTERVAL_TOKENS,
+    KEY_TOKENS,
+    MEASURE,
+    NOTE_TYPE_QUARTERS,
+    ORNAMENTS,
+    PEDAL_TOKENS,
+    PERCUSSION_CLEF,
+    PITCH_TOKENS,
+    REPEAT_BACKWARD,
+    REPEAT_FORWARD,
+    SPICCATO_TOKENS,
+    STAFF_TOKENS,
+    STEM_TOKENS,
+    STRESS_TOKENS,
+    SUFFIX_TO_ACCIDENTAL,
+    TIME_DEN_TOKENS,
+    TIME_MODIFICATIONS,
+    TIME_NUM_TOKENS,
+    TREMOLO_MARK_TOKENS,
+    TREMOLO_TYPE_TOKENS,
+    VOICE_TOKENS,
+    WEDGE_TOKENS,
+)
 
-PREFIX_TYPES = frozenset(
+# --------------------------------------------------------------------------- #
+# Token roles
+# --------------------------------------------------------------------------- #
+
+_NOTE_ROOTS = frozenset({*NOTE_TYPE_QUARTERS, "rest:measure"})
+_SIGNATURE_ROOTS = frozenset({*TIME_NUM_TOKENS, *KEY_TOKENS, *CLEF_TOKENS})
+_DIRECTION_ROOTS = frozenset({*DYNAMICS_TOKENS, *WEDGE_TOKENS, *PEDAL_TOKENS})
+_HARMONY_ROOTS = frozenset(HARMONY_ROOT_TOKENS)
+_TEMPO_RE = re.compile(r"^tempo:\d+$")
+
+_PITCHES = frozenset(PITCH_TOKENS)
+_INTERVALS = frozenset(INTERVAL_TOKENS)
+_VOICES = frozenset(VOICE_TOKENS)
+_PREFIXES = frozenset(
     {
-        "Hidden",
-        "Grace",
-        "Chord",
-        "Rest",
-        "Pitch",
-        "Interval",
-        "Voice",
-        "Backup",
-        "Forward",
+        "print-object:no",
+        "grace",
+        "grace:slash",
+        "chord",
+        "rest",
+        BACKUP,
+        FORWARD,
+        *_PITCHES,
+        *_INTERVALS,
+        *_VOICES,
     }
 )
-ROOT_TYPES = frozenset(
+
+_RATIOS = frozenset(TIME_MODIFICATIONS)
+_STEMS = frozenset(STEM_TOKENS)
+_STAVES = frozenset(STAFF_TOKENS)
+_BEAMS = frozenset(BEAM_TOKENS)
+_TREMOLO_TYPES = frozenset(TREMOLO_TYPE_TOKENS)
+_TREMOLO_MARKS = frozenset(TREMOLO_MARK_TOKENS)
+_ORNAMENTS = frozenset(ORNAMENTS)
+_GLISSANDOS = frozenset(GLISSANDO_TOKENS)
+_TIME_DENOMINATORS = frozenset(TIME_DEN_TOKENS)
+_SLURS = frozenset({"slur:start", "slur:stop"})
+_SUFFIXES = frozenset(
     {
-        "Duration",
-        "RestMeasure",
-        "Key",
-        "TimeSig",
-        "Clef",
-        "Tempo",
-        "Dynamics",
-        "Wedge",
-        "Pedal",
-        "HarmonyRoot",
-        "Repeat",
+        *_RATIOS,
+        "dot",
+        *_STEMS,
+        *_STAVES,
+        *_BEAMS,
+        "tied:start",
+        "tied:stop",
+        "tuplet:start",
+        "tuplet:stop",
+        *_SLURS,
+        "fermata",
+        "arpeggiate",
+        "staccato",
+        "accent",
+        "strong-accent",
+        "tenuto",
+        "trill-mark",
+        *_TREMOLO_TYPES,
+        *_TREMOLO_MARKS,
+        *STRESS_TOKENS,
+        *SPICCATO_TOKENS,
+        *_ORNAMENTS,
+        "breath-mark",
+        "caesura",
+        *_GLISSANDOS,
+        *HARMONY_QUALITY_TOKENS,
+        *HARMONY_EXT_TOKENS,
+        *HARMONY_BASS_TOKENS,
+        *_TIME_DENOMINATORS,
     }
 )
-SUFFIX_TYPES = frozenset(
-    {
-        "TimeMod",
-        "Dot",
-        "Stem",
-        "Staff",
-        "Beam",
-        "Tie",
-        "Slur",
-        "Tuplet",
-        "Articulation",
-        "Ornament",
-        "Tremolo",
-        "Notation",
-        "HarmonyKind",
-        "HarmonyBass",
-    }
-)
-_NOTE_ROOTS = frozenset({"Duration", "RestMeasure"})
-_STEMMED_TYPES = frozenset(NOTE_TYPES[: NOTE_TYPES.index("half") + 1])
 
-Token = tuple[str, str]
+# Articulations in the order MuseScore writes them.
+_ARTICULATION_ORDER = ("accent", "strong-accent", "tenuto", "staccato")
+_KIND_OF_SPLIT = {split: kind for kind, split in HARMONY_KINDS.items()}
+_HARMONY_SUFFIX_ALTERS = {"bb": -2, "b": -1, "#": 1, "##": 2}
+_DEFAULT_MEASURE_DURATION = Fraction(4)  # when no time signature is known
 
 
-def parse_pitch_token(value: str) -> tuple[str, int, str | None]:
-    """``"F4#"`` -> ``("F", 4, "sharp")``."""
-    step, rest = value[0], value[1:]
-    digits = ""
-    while rest and rest[0].isdigit():
-        digits, rest = digits + rest[0], rest[1:]
-    if (
-        not digits
-        or step not in "CDEFGAB"
-        or (rest and rest not in SUFFIX_TO_ACCIDENTAL)
-    ):
-        raise MxlTokError(f"Invalid pitch token value {value!r}")
-    return step, int(digits), SUFFIX_TO_ACCIDENTAL.get(rest)
+def is_root(token: str) -> bool:
+    """Whether a token is the root of a group (a note type, a signature...)."""
+    return (
+        token in _NOTE_ROOTS
+        or token in _SIGNATURE_ROOTS
+        or token in _DIRECTION_ROOTS
+        or token in _HARMONY_ROOTS
+        or _TEMPO_RE.match(token) is not None
+    )
 
 
-def parse_interval_token(value: str) -> tuple[int, str | None]:
-    """``"+3#"`` -> ``(3, "sharp")``."""
-    digits = value.rstrip("#bn")
-    suffix = value[len(digits) :]
-    if not digits or digits[0] not in "+-" or not digits[1:].isdigit():
-        raise MxlTokError(f"Invalid interval token value {value!r}")
-    if suffix and suffix not in SUFFIX_TO_ACCIDENTAL:
-        raise MxlTokError(f"Invalid interval token value {value!r}")
-    return int(digits), SUFFIX_TO_ACCIDENTAL.get(suffix)
+def is_prefix(token: str) -> bool:
+    """Whether a token comes before the root of its group."""
+    return token in _PREFIXES
 
 
-def duration_of(type_: str, dots: int, time_mod: tuple[int, int] | None) -> Fraction:
-    """Duration in quarters of a note type with dots and tuplet ratio."""
-    duration = NOTE_TYPE_QUARTERS[type_] * (2 - Fraction(1, 2**dots))
-    if time_mod is not None:
-        duration = duration * time_mod[1] / time_mod[0]
-    return duration
+def is_suffix(token: str) -> bool:
+    """Whether a token comes after the root of its group."""
+    return token in _SUFFIXES
 
 
-@dataclass(slots=True)
-class Group:
+# --------------------------------------------------------------------------- #
+# Groups
+# --------------------------------------------------------------------------- #
+
+
+class _Malformed(Exception):
+    """A group of tokens that does not form a valid element."""
+
+
+@dataclass
+class _Group:
     """A root token with the prefix and suffix tokens attached to it."""
 
-    root: Token
-    prefixes: list[Token] = field(default_factory=list)
-    suffixes: list[Token] = field(default_factory=list)
+    root: str
+    prefixes: list[str] = field(default_factory=list)
+    suffixes: list[str] = field(default_factory=list)
 
-    def values(self, type_: str, source: list[Token]) -> list[str]:
-        return [value for t, value in source if t == type_]
+    def prefix(self, accepted: Collection[str]) -> str | None:
+        """Remove and return the prefix of ``accepted``, if any."""
+        return _take_one(self.prefixes, accepted, self.root)
 
-    def prefix(self, type_: str) -> str | None:
-        return next((v for t, v in self.prefixes if t == type_), None)
+    def suffix(self, accepted: Collection[str]) -> str | None:
+        """Remove and return the suffix of ``accepted``, if any."""
+        return _take_one(self.suffixes, accepted, self.root)
 
-    def suffix(self, type_: str) -> str | None:
-        return next((v for t, v in self.suffixes if t == type_), None)
+    def all_suffixes(self, accepted: Collection[str]) -> list[str]:
+        """Remove and return every suffix of ``accepted``, in order."""
+        taken = [token for token in self.suffixes if token in accepted]
+        self.suffixes = [token for token in self.suffixes if token not in accepted]
+        return taken
+
+    def has_suffix(self, token: str) -> bool:
+        """Remove ``token`` from the suffixes and tell whether it was there."""
+        return self.suffix({token}) is not None
+
+    def check_consumed(self) -> None:
+        """Raise if a prefix or suffix was not used."""
+        if self.prefixes or self.suffixes:
+            leftovers = " ".join([*self.prefixes, *self.suffixes])
+            raise _Malformed(f"Unexpected tokens for '{self.root}': {leftovers}")
 
 
-@dataclass(slots=True)
+def _take_one(tokens: list[str], accepted: Collection[str], root: str) -> str | None:
+    found = [token for token in tokens if token in accepted]
+    if len(found) > 1:
+        raise _Malformed(f"Conflicting tokens {found} for '{root}'")
+    if found:
+        tokens.remove(found[0])
+    return found[0] if found else None
+
+
+def _value(token: str | None, transform: Callable[[str], int] = int) -> int | None:
+    """Return the value after the last colon of a token, if there is a token."""
+    return None if token is None else transform(token.rsplit(":", 1)[1])
+
+
+# --------------------------------------------------------------------------- #
+# Decoder
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
 class _State:
-    time: tuple[int, int] = (4, 4)
+    """What the decoder remembers while reading a part."""
+
+    # Part scope
+    measure_duration: Fraction | None = None  # from the last time signature
+    previous_pitch: str | None = None  # resolves interval tokens
+
+    # Measure scope
     voice: int | None = None
-    staff: int | None = None
     stem: str | None = None
+    staff: int | None = None
     open_beams: int = 0
-    open_beams_grace: int = 0
-    prev_pitch: int | None = None  # diatonic index of the previous pitched note
-    clefs: dict[int, str] = field(default_factory=dict)
+    open_grace_beams: int = 0
+    attributes: Attributes | None = None  # extended by consecutive signatures
+    last_element: Element | None = None  # merges consecutive cursor moves
 
-    def reset(self) -> None:
-        self.voice = self.staff = self.stem = None
-        self.open_beams = self.open_beams_grace = 0
-
-    def new_measure(self) -> None:
-        self.reset()
-        self.prev_pitch = None
+    def start_measure(self) -> None:
+        self.voice = self.stem = self.staff = None
+        self.open_beams = self.open_grace_beams = 0
+        self.attributes = self.last_element = None
 
 
 class PartDecoder:
-    """Rebuild the measures of a :class:`Part` from their tokens."""
+    """Turns the LMX tokens of a part back into measures.
 
-    def __init__(self, config: TokenizerConfig) -> None:
-        self.config = config
+    Args:
+        strict: Raise :class:`MxlTokError` on malformed tokens instead of
+            skipping them with a warning.
+    """
 
-    @staticmethod
-    def _problem(message: str, strict: bool) -> None:
-        if strict:
-            raise MxlTokError(message)
-        warnings.warn(message, stacklevel=3)
+    def __init__(self, strict: bool = False) -> None:
+        self.strict = strict
 
-    def decode(self, measures: list[list[str]], strict: bool = False) -> list[Measure]:
+    def decode(self, tokens: Sequence[str]) -> list[Measure]:
+        """Return the measures of a part, given its tokens (without ``part:*``)."""
         state = _State()
         part = Part(id="")
-        for tokens in measures:
-            state.new_measure()
-            part.measures.append(self._measure(tokens, state, strict))
-        resolve_alters(part, ACCIDENTAL_ALTER)
-        self._finalize(part, state)
+        for measure_tokens in self._split_measures(tokens):
+            part.measures.append(self._measure(measure_tokens, state))
+        _declare_staves(part)
+        resolve_alters(part)
+        _end_with_final_barline(part)
         return part.measures
 
-    @staticmethod
-    def _finalize(part: Part, state: _State) -> None:
-        if not part.measures:
-            return
-        staves = max(state.clefs, default=1)
-        if staves > 1:
-            first = part.measures[0].elements
-            attributes = next((e for e in first if isinstance(e, Attributes)), None)
-            if attributes is None:
-                attributes = Attributes()
-                first.insert(0, attributes)
-            attributes.staves = max(attributes.staves or 0, staves)
-        last = part.measures[-1].elements
-        if not any(isinstance(e, Barline) and e.location == "right" for e in last):
-            last.append(Barline("right", None, "light-heavy"))
+    def _problem(self, message: str) -> None:
+        if self.strict:
+            raise MxlTokError(message)
+        warnings.warn(message, stacklevel=2)
 
-    def _group(self, tokens: list[str], strict: bool) -> list[Group]:
-        groups: list[Group] = []
-        pending: list[Token] = []
-        current: Group | None = None
+    @staticmethod
+    def _split_measures(tokens: Sequence[str]) -> list[list[str]]:
+        """Split the tokens at each ``measure`` token.
+
+        Repeat tokens come right before the ``measure`` token of the measure
+        they belong to, as the encoder writes them; trailing ones belong to
+        the last measure. (mxlGPT's decoder attached backward repeats to the
+        previous measure, moving them one measure early.) Tokens before the
+        first ``measure`` form a measure of their own; without any
+        ``measure`` token there is no measure.
+        """
+        measures: list[list[str]] = []
+        leading: list[str] = []
+        current: list[str] = []
+        repeats: list[str] = []
+        started = False
         for token in tokens:
-            type_, _, value = token.partition("_")
-            if type_ in ROOT_TYPES:
-                if current is not None:
-                    groups.append(current)
-                current = Group((type_, value), pending)
-                pending = []
-            elif type_ in PREFIX_TYPES:
-                if current is not None:  # a prefix always starts a new group
-                    groups.append(current)
-                    current = None
-                pending.append((type_, value))
-            elif type_ in SUFFIX_TYPES:
-                if current is None:
-                    self._problem(f"Suffix token {token} without a root token", strict)
-                    continue
-                current.suffixes.append((type_, value))
+            if token == MEASURE:
+                if started:
+                    measures.append(current)
+                else:
+                    leading = current
+                current, repeats = repeats, []
+                started = True
+            elif token in (REPEAT_FORWARD, REPEAT_BACKWARD):
+                repeats.append(token)
             else:
-                self._problem(f"Unknown token {token}", strict)
-        if current is not None:
-            groups.append(current)
-        if pending:
-            self._problem(f"Dangling prefix tokens {pending}", strict)
+                current.append(token)
+        if not started:
+            return []
+        measures.append(current + repeats)
+        return [leading, *measures] if leading else measures
+
+    def _measure(self, tokens: list[str], state: _State) -> Measure:
+        state.start_measure()
+        measure = Measure()
+        body = [t for t in tokens if t not in (REPEAT_FORWARD, REPEAT_BACKWARD)]
+        for group in self._groups(body):
+            if group.root not in _SIGNATURE_ROOTS:
+                state.attributes = None
+            if group.root not in _NOTE_ROOTS:
+                state.last_element = None
+            try:
+                self._decode_group(group, measure, state)
+            except _Malformed as exc:
+                self._problem(str(exc))
+        forward = Barline("left", "forward", "heavy-light")
+        backward = Barline("right", "backward", "light-heavy")
+        measure.elements = [
+            *[forward] * tokens.count(REPEAT_FORWARD),
+            *measure.elements,
+            *[backward] * tokens.count(REPEAT_BACKWARD),
+        ]
+        return measure
+
+    def _groups(self, tokens: Sequence[str]) -> list[_Group]:
+        """Attach every prefix and suffix token to its root.
+
+        Prefixes attach to the next root, and a prefix after a note root
+        closes that note. Suffixes attach to the current root, or to the next
+        one when the current group is closed.
+        """
+        groups: list[_Group] = []
+        current: _Group | None = None
+        prefixes: list[str] = []
+        suffixes: list[str] = []
+        for token in tokens:
+            if is_root(token):
+                current = _Group(token, prefixes, suffixes)
+                groups.append(current)
+                prefixes, suffixes = [], []
+            elif is_prefix(token):
+                if current is not None and current.root in _NOTE_ROOTS:
+                    current = None
+                prefixes.append(token)
+            elif is_suffix(token):
+                (current.suffixes if current is not None else suffixes).append(token)
+            else:
+                self._problem(f"Unexpected token in a measure: {token}")
         return groups
 
-    def _measure(self, tokens: list[str], state: _State, strict: bool) -> Measure:
-        elements: list[Element] = []
-        for group in self._group(tokens, strict):
-            root_type, value = group.root
-            element: Element | None
-            if root_type in _NOTE_ROOTS:
-                if (
-                    group.prefix("Backup") is not None
-                    or group.prefix("Forward") is not None
-                ):
-                    element = self._backup_forward(group, state, strict)
-                    if isinstance(element, Backup):
-                        state.reset()
-                else:
-                    element = self._note(group, state, strict)
-            elif root_type in ("Key", "TimeSig", "Clef"):
-                previous = elements[-1] if elements else None
-                if not isinstance(previous, Attributes):
-                    previous = Attributes()
-                    elements.append(previous)
-                self._attributes(group, previous, state, strict)
-                continue
-            elif root_type == "HarmonyRoot":
-                element = self._harmony(group, strict)
-            elif root_type == "Repeat":
-                if value == "forward":
-                    elements.insert(0, Barline("left", "forward", "heavy-light"))
-                else:
-                    elements.append(Barline("right", "backward", "light-heavy"))
-                continue
-            else:
-                self._check_bare(group, strict)
-                element = Direction(cast(DirectionKind, root_type.lower()), value)
-            if element is not None:
-                elements.append(element)
-        return Measure(elements)
+    def _decode_group(self, group: _Group, measure: Measure, state: _State) -> None:
+        """Decode a group into an element of ``measure``."""
+        if group.root in _SIGNATURE_ROOTS:
+            if state.attributes is None:
+                state.attributes = Attributes()
+                measure.elements.append(state.attributes)
+            self._signature(group, state.attributes, state)
+        elif group.root in _NOTE_ROOTS:
+            element = self._note_or_cursor_move(group, state)
+            if not _merge_cursor_moves(state.last_element, element):
+                measure.elements.append(element)
+                state.last_element = element
+        elif group.root in _HARMONY_ROOTS:
+            measure.elements.append(self._harmony(group))
+        else:  # dynamics, wedge, pedal or tempo
+            kind, value = group.root.split(":", 1)
+            measure.elements.append(Direction(kind, value))
 
-    def _check_bare(self, group: Group, strict: bool) -> None:
-        if group.prefixes or group.suffixes:
-            self._problem(f"Unexpected tokens attached to {group.root}", strict)
+    # ------------------------------------------------------------- notes
 
-    def _attributes(
-        self, group: Group, attributes: Attributes, state: _State, strict: bool
-    ) -> None:
-        root_type, value = group.root
-        if root_type == "Key":
-            attributes.key = int(value)
-        elif root_type == "TimeSig":
-            beats, beat_type = value.split("/")
-            attributes.time = state.time = (int(beats), int(beat_type))
-        else:
-            number = int(group.suffix("Staff") or 1)
-            if value == "percussion":
-                clef = Clef("percussion", None, number)
-            else:
-                clef = Clef(value[0], int(value[1:]), number)
-            attributes.clefs.append(clef)
-            state.clefs[number] = value
-        if group.prefixes or [t for t, _ in group.suffixes if t != "Staff"]:
-            self._problem(f"Unexpected tokens attached to {group.root}", strict)
+    def _note_or_cursor_move(
+        self, group: _Group, state: _State
+    ) -> Note | Backup | Forward:
+        for tag, move in ((BACKUP, Backup), (FORWARD, Forward)):
+            if group.prefix({tag}) is not None:
+                # A cursor move breaks the beams: the next voice starts afresh.
+                state.open_beams = state.open_grace_beams = 0
+                if group.root == "rest:measure":
+                    raise _Malformed(f"A measure rest cannot be a {tag}.")
+                ratio = group.suffix(_RATIOS)
+                group.check_consumed()
+                return move(note_duration(group.root, 0, ratio))
+        return self._note(group, state)
 
-    def _duration(
-        self, group: Group, strict: bool
-    ) -> tuple[str, int, tuple[int, int] | None] | None:
-        type_ = group.root[1]
-        dots = int(group.suffix("Dot") or 0)
-        time_mod: tuple[int, int] | None = None
-        if (ratio := group.suffix("TimeMod")) is not None:
-            actual, normal = ratio.split("in")
-            time_mod = (int(actual), int(normal))
-        return type_, dots, time_mod
-
-    def _backup_forward(
-        self, group: Group, state: _State, strict: bool
-    ) -> Backup | Forward | None:
-        if group.root[0] == "RestMeasure":
-            self._problem("RestMeasure cannot be a backup/forward root", strict)
-            return None
-        type_, dots, time_mod = self._duration(group, strict) or ("quarter", 0, None)
-        duration = duration_of(type_, dots, time_mod)
-        return (
-            Backup(duration)
-            if group.prefix("Backup") is not None
-            else Forward(duration)
+    def _note(self, group: _Group, state: _State) -> Note:
+        """Decode a note group; prefixes and suffixes are read in a fixed order."""
+        note = Note(
+            print_object=group.prefix({"print-object:no"}) is None,
+            grace=group.prefix({"grace"}) is not None,
+            grace_slash=group.prefix({"grace:slash"}) is not None,
+            chord=group.prefix({"chord"}) is not None,
+            rest=group.prefix({"rest"}) is not None,
         )
+        pitch = group.prefix(_PITCHES)
+        interval = group.prefix(_INTERVALS) if pitch is None else None
+        voice = _value(group.prefix(_VOICES))
+        ratio = group.suffix(_RATIOS)
+        dots = len(group.all_suffixes({"dot"}))
+        stem = group.suffix(_STEMS)
+        staff = _value(group.suffix(_STAVES))
+        beams = group.all_suffixes(_BEAMS)
+        note.ties = tuple(t for t in ("stop", "start") if group.has_suffix(f"tied:{t}"))
+        note.tuplets = tuple(
+            t for t in ("stop", "start") if group.has_suffix(f"tuplet:{t}")
+        )
+        slurs = [s.removeprefix("slur:") for s in group.all_suffixes(_SLURS)]
+        note.slurs = tuple(sorted(slurs, key=lambda slur: slur != "stop"))
+        note.fermata = group.has_suffix("fermata")
+        note.arpeggiate = group.has_suffix("arpeggiate")
+        articulations = [a for a in _ARTICULATION_ORDER if group.has_suffix(a)]
+        tremolo_type = group.suffix(_TREMOLO_TYPES)
+        tremolo_marks = group.suffix(_TREMOLO_MARKS)
+        ornaments = ["trill-mark"] if group.has_suffix("trill-mark") else []
+        if group.suffix(STRESS_TOKENS) is not None:
+            articulations.append("stress")
+        if group.suffix(SPICCATO_TOKENS) is not None:
+            articulations.append("spiccato")
+        ornaments += group.all_suffixes(_ORNAMENTS)
+        articulations += [a for a in ("breath-mark", "caesura") if group.has_suffix(a)]
+        glissandos = group.all_suffixes(_GLISSANDOS)
+        group.check_consumed()
 
-    def _note(self, group: Group, state: _State, strict: bool) -> Note | None:
-        note = Note()
-        note.print_object = group.prefix("Hidden") is None
-        if (grace := group.prefix("Grace")) is not None:
-            note.grace = True
-            note.grace_slash = grace == "slash"
-        note.chord = group.prefix("Chord") is not None
-        pitch = group.prefix("Pitch")
-        interval = group.prefix("Interval")
+        if interval is not None:
+            if state.previous_pitch is None:
+                self._problem(f"No pitch before '{interval}': decoded as a rest.")
+            else:
+                pitch = interval_to_absolute(interval, state.previous_pitch)
         if pitch is not None:
-            note.step, note.octave, note.accidental = parse_pitch_token(pitch)
-        elif interval is not None and state.prev_pitch is not None:
-            steps, note.accidental = parse_interval_token(interval)
-            index = max(0, min(state.prev_pitch + steps, 7 * 10 - 1))
-            note.step, note.octave = PITCH_STEPS[index % 7], index // 7
-        elif group.prefix("Rest") is not None or group.root[0] == "RestMeasure":
+            state.previous_pitch = pitch
+        if pitch is None or note.rest:
             note.rest = True
         else:
-            what = "an interval without a previous pitch" if interval else "no pitch"
-            self._problem(f"Note group {group.root} has {what}; using a rest", strict)
-            note.rest = True
-        if note.step is not None and note.octave is not None:
-            state.prev_pitch = note.octave * 7 + PITCH_STEPS.index(note.step)
-        if (voice := group.prefix("Voice")) is not None:
-            state.voice = int(voice)
+            step, octave, suffix = split_pitch_token(pitch)
+            note.step, note.octave = step, octave
+            note.accidental = SUFFIX_TO_ACCIDENTAL.get(suffix)
+
+        if group.root == "rest:measure":
+            note.rest = note.measure_rest = True
+            measure_duration = state.measure_duration or _DEFAULT_MEASURE_DURATION
+            note.duration = Fraction(0) if note.grace else measure_duration
+        else:
+            note.type_, note.dots = group.root, dots
+            if not note.grace:
+                note.duration = note_duration(group.root, dots, ratio)
+        if ratio is not None:
+            actual, normal = ratio.split("in")
+            note.time_modification = (int(actual), int(normal))
+
+        # Voice, stem and staff carry over from the previous note of the measure.
+        state.voice = voice if voice is not None else state.voice
         note.voice = state.voice
-        if group.root[0] == "RestMeasure":
-            note.rest_measure = True
-            note.duration = Fraction(state.time[0] * 4, state.time[1])
-        else:
-            type_, dots, time_mod = self._duration(group, strict) or (
-                "quarter",
-                0,
-                None,
-            )
-            note.type_, note.dots, note.time_mod = type_, dots, time_mod
-            note.duration = (
-                Fraction(0) if note.grace else duration_of(type_, dots, time_mod)
-            )
-        if (stem := group.suffix("Stem")) is not None:
-            state.stem = stem
-        if not note.rest and note.type_ in _STEMMED_TYPES:
+        if not note.rest and note.type_ != "whole":
+            state.stem = stem.removeprefix("stem:") if stem is not None else state.stem
             note.stem = state.stem
-        if (staff := group.suffix("Staff")) is not None:
-            state.staff = int(staff)
+        state.staff = staff if staff is not None else state.staff
         note.staff = state.staff
-        if not note.rest and state.clefs.get(note.staff or 1) == "percussion":
-            note.unpitched = True
-        if not note.chord:
-            beams = group.values("Beam", group.suffixes)
+        if not note.chord and not note.rest:
             if note.grace:
-                note.beams, state.open_beams_grace = _number_beams(
-                    beams, state.open_beams_grace
+                note.beams, state.open_grace_beams = number_beams(
+                    beams, state.open_grace_beams
                 )
             else:
-                note.beams, state.open_beams = _number_beams(beams, state.open_beams)
-        note.ties = tuple(group.values("Tie", group.suffixes))
-        note.slurs = tuple(group.values("Slur", group.suffixes))
-        note.tuplets = tuple(group.values("Tuplet", group.suffixes))
-        note.articulations = tuple(group.values("Articulation", group.suffixes))
-        ornaments: list[str] = []
-        for type_, value in group.suffixes:
-            if type_ == "Ornament":
-                ornaments.append(value)
-            elif type_ == "Tremolo":
-                kind, marks = value.rsplit("-", 1)
-                ornaments.append(f"tremolo:{kind}:{marks}")
+                note.beams, state.open_beams = number_beams(beams, state.open_beams)
+
+        note.articulations = tuple(articulations)
+        if tremolo_type is not None:
+            marks = tremolo_marks.removeprefix("tremolo:") if tremolo_marks else "3"
+            note.tremolo = (tremolo_type.removeprefix("tremolo:"), marks)
+            ornaments.append("tremolo")
         note.ornaments = tuple(ornaments)
-        note.notations = tuple(group.values("Notation", group.suffixes))
+        note.glissandos = tuple(g.removeprefix("glissando:") for g in glissandos)
         return note
 
-    def _harmony(self, group: Group, strict: bool) -> Harmony:
-        root = group.root[1]
-        bass = group.suffix("HarmonyBass")
-        harmony = Harmony(
-            root=root[0],
-            root_alter=_harmony_alter(root[1:]),
-            kind=group.suffix("HarmonyKind") or "major",
-            bass=bass[0] if bass else None,
-            bass_alter=_harmony_alter(bass[1:]) if bass else 0,
-        )
-        if group.prefixes or any(
-            t not in ("HarmonyKind", "HarmonyBass") for t, _ in group.suffixes
-        ):
-            self._problem(f"Unexpected tokens attached to {group.root}", strict)
+    # -------------------------------------------------- other elements
+
+    @staticmethod
+    def _signature(group: _Group, attributes: Attributes, state: _State) -> None:
+        """Decode a key, time signature or clef into ``attributes``."""
+        root = group.root
+        if root in TIME_NUM_TOKENS:
+            beats = _value(root)
+            beat_type = _value(group.suffix(_TIME_DENOMINATORS)) or 4
+            assert beats is not None
+            attributes.time = (beats, beat_type)
+            state.measure_duration = Fraction(4 * beats, beat_type)
+        elif root in KEY_TOKENS:
+            attributes.key = _value(root)
+        else:
+            number = _value(group.suffix(_STAVES)) or 1
+            if root == PERCUSSION_CLEF:
+                attributes.clefs.append(Clef("percussion", number=number))
+            else:
+                sign, line = (
+                    root.removeprefix("clef:")[0],
+                    root.removeprefix("clef:")[1:],
+                )
+                attributes.clefs.append(Clef(sign, int(line), number))
+        group.check_consumed()
+
+    @staticmethod
+    def _harmony(group: _Group) -> Harmony:
+        """Decode a chord symbol; unrelated suffixes are ignored."""
+
+        def suffix_value(prefix: str) -> str | None:
+            token = next((t for t in group.suffixes if t.startswith(prefix)), None)
+            return None if token is None else token.removeprefix(prefix)
+
+        quality = suffix_value("harmony:quality:")
+        extension = suffix_value("harmony:ext:")
+        kind = _KIND_OF_SPLIT.get((quality, extension)) if quality else None
+        if kind is None:
+            kind = f"{quality}-{extension}" if extension else quality or "major"
+        root, root_alter = _harmony_pitch(group.root.removeprefix("harmony:root:"))
+        harmony = Harmony(root, root_alter, kind)
+        bass = suffix_value("harmony:bass:")
+        if bass is not None:
+            harmony.bass, harmony.bass_alter = _harmony_pitch(bass)
         return harmony
 
 
-def _harmony_alter(suffix: str) -> int:
-    return {"": 0, "#": 1, "b": -1}[suffix]
+def note_duration(note_type: str, dots: int, ratio: str | None) -> Fraction:
+    """Return the duration in quarters of a dotted, possibly tuplet, note type."""
+    duration = NOTE_TYPE_QUARTERS[note_type] * (2 - Fraction(1, 2**dots))
+    if ratio is not None:
+        actual, normal = ratio.split("in")
+        duration *= Fraction(int(normal), int(actual))
+    return duration
 
 
-def _number_beams(values: list[str], open_count: int) -> tuple[tuple[str, ...], int]:
-    """Rebuild numbered beams from ``begin``/``end``/hook tokens and the open count."""
-    delta = values.count("begin") - values.count("end")
-    if delta < -open_count:
-        open_count = -delta
-    beams: list[str] = []
+def number_beams(tokens: Sequence[str], open_beams: int) -> tuple[tuple[str, ...], int]:
+    """Return the MusicXML ``<beam>`` values of a note and the new open beam count.
+
+    ``beam:begin`` and ``beam:end`` open and close beams, the beams left open
+    are continued, and hooks come last.
+    """
+    delta = tokens.count("beam:begin") - tokens.count("beam:end")
+    open_beams = max(open_beams, -delta)  # cannot close more beams than are open
     if delta >= 0:
-        beams += ["continue"] * open_count + ["begin"] * delta
-        open_count += delta
+        beams = ["continue"] * open_beams + ["begin"] * delta
     else:
-        beams += ["continue"] * (open_count + delta) + ["end"] * (-delta)
-        open_count += delta
-    beams += [v.replace("-", " ") for v in values if "hook" in v]
-    return tuple(beams), max(open_count, 0)
+        beams = ["continue"] * (open_beams + delta) + ["end"] * -delta
+    beams += [
+        token.removeprefix("beam:").replace("-", " ")
+        for token in tokens
+        if token.endswith("-hook")
+    ]
+    return tuple(beams), open_beams + delta
+
+
+def _merge_cursor_moves(last: Element | None, element: Element) -> bool:
+    """Extend ``last`` by ``element`` if both are backups or both forwards."""
+    for move in (Backup, Forward):
+        if isinstance(last, move) and isinstance(element, move):
+            last.duration += element.duration
+            return True
+    return False
+
+
+def _harmony_pitch(name: str) -> tuple[str, int]:
+    """Split a chord symbol pitch: ``"Bb"`` -> ``("B", -1)``."""
+    return name[0], _HARMONY_SUFFIX_ALTERS.get(name[1:], 0)
+
+
+def _declare_staves(part: Part) -> None:
+    """Declare the staff count of a multi-staff part in its first measure."""
+    staves = max(
+        (
+            clef.number
+            for measure in part.measures
+            for element in measure.elements
+            if isinstance(element, Attributes)
+            for clef in element.clefs
+        ),
+        default=1,
+    )
+    if staves < 2:
+        return
+    elements = part.measures[0].elements
+    position = next(
+        (i for i, e in enumerate(elements) if not isinstance(e, Barline)), len(elements)
+    )
+    head = elements[position] if position < len(elements) else None
+    if not isinstance(head, Attributes):
+        head = Attributes()
+        elements.insert(position, head)
+    head.staves = staves
+
+
+def _end_with_final_barline(part: Part) -> None:
+    """End the last measure with a final barline, unless it has a right one."""
+    if not part.measures:
+        return
+    elements = part.measures[-1].elements
+    if not any(isinstance(e, Barline) and e.location == "right" for e in elements):
+        elements.append(Barline("right", None, "light-heavy"))

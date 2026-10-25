@@ -1,30 +1,32 @@
-"""Typed in-memory representation of a MusicXML score.
+"""Typed in-memory model of the MusicXML subset that LMX encodes.
 
-Durations are :class:`fractions.Fraction` values in quarter notes; the MusicXML
-``<divisions>`` unit is resolved on load and recomputed on write. The model is a
-faithful *subset* of MusicXML: layout, lyrics, text and playback-only data are
-dropped.
+A :class:`Score` holds parts, a part holds measures, and a measure holds its
+elements in document order. Durations are :class:`~fractions.Fraction` values
+in quarter notes: the MusicXML ``<divisions>`` unit is resolved when reading
+and recomputed when writing. Layout, lyrics, text and playback-only data are
+not modelled.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Literal
-
-DirectionKind = Literal["dynamics", "wedge", "pedal", "tempo"]
 
 
 @dataclass(slots=True)
 class Clef:
-    sign: str
+    """A clef; ``sign`` is ``None`` when the MusicXML ``<sign>`` is missing."""
+
+    sign: str | None
     line: int | None = None
     number: int = 1
 
 
 @dataclass(slots=True)
 class Attributes:
+    """Key signature (in fifths), time signature, staff count and clefs."""
+
     key: int | None = None
     time: tuple[int, int] | None = None
     staves: int | None = None
@@ -33,53 +35,79 @@ class Attributes:
 
 @dataclass(slots=True)
 class Note:
-    """A note, rest or unpitched note. Grace notes have a zero duration."""
+    """A note, rest or unpitched note.
+
+    ``accidental`` is the *printed* accidental while ``alter`` is the sounding
+    alteration in semitones. Grace notes have a zero duration. ``ornaments``
+    lists the ``<ornaments>`` children in order, where ``"tremolo"`` stands
+    for the ``(type, marks)`` pair stored in ``tremolo``.
+    """
 
     duration: Fraction = Fraction(0)
     type_: str | None = None
+    dots: int = 0
     step: str | None = None
     octave: int | None = None
-    alter: float = 0.0
+    alter: float = 0
     accidental: str | None = None
     rest: bool = False
-    rest_measure: bool = False
-    chord: bool = False
+    measure_rest: bool = False
     unpitched: bool = False
+    chord: bool = False
     grace: bool = False
     grace_slash: bool = False
     print_object: bool = True
     voice: int | None = None
     staff: int | None = None
-    dots: int = 0
     stem: str | None = None
-    time_mod: tuple[int, int] | None = None
+    time_modification: tuple[int, int] | None = None
     ties: tuple[str, ...] = ()
+    beams: tuple[str, ...] = ()
     slurs: tuple[str, ...] = ()
     tuplets: tuple[str, ...] = ()
-    beams: tuple[str, ...] = ()
     articulations: tuple[str, ...] = ()
     ornaments: tuple[str, ...] = ()
-    notations: tuple[str, ...] = ()
+    tremolo: tuple[str, str] | None = None
+    fermata: bool = False
+    arpeggiate: bool = False
+    glissandos: tuple[str, ...] = ()
+
+    @property
+    def is_pitched(self) -> bool:
+        """Whether the note has a pitch (it is neither a rest nor unpitched)."""
+        return not (self.rest or self.unpitched or self.step is None)
 
 
 @dataclass(slots=True)
 class Backup:
+    """Move the measure cursor back in time (to write another voice)."""
+
     duration: Fraction
 
 
 @dataclass(slots=True)
 class Forward:
+    """Move the measure cursor forward in time (an invisible rest)."""
+
     duration: Fraction
 
 
 @dataclass(slots=True)
 class Direction:
-    kind: DirectionKind
+    """A dynamic, wedge, pedal or tempo marking.
+
+    ``value`` is the dynamic name (``"mf"``), the wedge or pedal type
+    (``"crescendo"``, ``"start"``) or the tempo in BPM (``"120"``).
+    """
+
+    kind: str
     value: str
 
 
 @dataclass(slots=True)
 class Harmony:
+    """A chord symbol: root, MusicXML ``<kind>`` and optional bass."""
+
     root: str
     root_alter: int = 0
     kind: str = "major"
@@ -89,21 +117,27 @@ class Harmony:
 
 @dataclass(slots=True)
 class Barline:
+    """A barline with an optional repeat direction and bar style."""
+
     location: str = "right"
     repeat: str | None = None
     style: str | None = None
 
 
-Element = Note | Backup | Forward | Attributes | Direction | Harmony | Barline
+Element = Attributes | Note | Backup | Forward | Direction | Harmony | Barline
 
 
 @dataclass(slots=True)
 class Measure:
+    """The elements of one measure, in document order."""
+
     elements: list[Element] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class Part:
+    """A part: its name, MIDI instrument and measures."""
+
     id: str
     name: str = ""
     midi_program: int | None = None
@@ -113,16 +147,34 @@ class Part:
 
 @dataclass(slots=True)
 class Score:
+    """A score: a list of parts."""
+
     parts: list[Part] = field(default_factory=list)
 
 
-PitchKey = tuple[int, str, int]  # (staff, step, octave)
+# --------------------------------------------------------------------------- #
+# Alterations
+# --------------------------------------------------------------------------- #
+
+# Semitones of the accidentals the alteration logic understands.
+ACCIDENTAL_ALTERS: dict[str, int] = {
+    "natural": 0,
+    "sharp": 1,
+    "flat": -1,
+    "double-sharp": 2,
+    "flat-flat": -2,
+    "natural-sharp": 1,
+    "natural-flat": -1,
+}
 _SHARP_ORDER = "FCGDAEB"
 _FLAT_ORDER = "BEADGCF"
 
+# A pitched note's place on the staff: (staff, step, octave).
+PitchKey = tuple[int, str, int | None]
+
 
 def key_alter(fifths: int, step: str) -> int:
-    """Alteration implied by a key signature for a step (``-1``, ``0`` or ``1``)."""
+    """Return the alteration (-1, 0 or 1) a key signature gives to a step."""
     if fifths > 0 and step in _SHARP_ORDER[:fifths]:
         return 1
     if fifths < 0 and step in _FLAT_ORDER[:-fifths]:
@@ -131,118 +183,100 @@ def key_alter(fifths: int, step: str) -> int:
 
 
 def pitch_key(note: Note) -> PitchKey | None:
-    """Identity of a pitched note's staff line, or ``None`` for rests/unpitched."""
-    if note.rest or note.unpitched or note.step is None or note.octave is None:
+    """Return the staff position of a pitched note, ``None`` for other notes."""
+    if not note.is_pitched:
         return None
+    assert note.step is not None
     return (note.staff or 1, note.step, note.octave)
 
 
 def measure_onsets(measure: Measure) -> list[Fraction]:
-    """Onset (quarters from the measure start) of every element of ``measure``."""
+    """Return the onset (in quarters from the measure start) of each element."""
     onsets: list[Fraction] = []
-    cursor = Fraction(0)
-    last_note_onset = Fraction(0)
+    cursor = last_onset = Fraction(0)
     for element in measure.elements:
         onset = cursor
-        match element:
-            case Note(chord=True):
-                onset = last_note_onset
-            case Note():
-                last_note_onset = cursor
+        if isinstance(element, Note):
+            if element.chord:
+                onset = last_onset
+            else:
+                last_onset = cursor
                 cursor += element.duration
-            case Backup():
-                cursor -= element.duration
-            case Forward():
-                cursor += element.duration
+        elif isinstance(element, Backup):
+            cursor -= element.duration
+        elif isinstance(element, Forward):
+            cursor += element.duration
         onsets.append(onset)
     return onsets
 
 
-class AlterTracker:
-    """Resolve the alteration of notes from key, in-measure accidentals and ties.
+def _pitched_notes(measure: Measure) -> Iterator[tuple[Note, PitchKey, Fraction]]:
+    for element, onset in zip(measure.elements, measure_onsets(measure), strict=True):
+        if isinstance(element, Note) and (key := pitch_key(element)) is not None:
+            yield element, key, onset
 
-    Printed accidentals are :meth:`record`-ed per measure; :meth:`expected` then
-    gives the alteration a note carries when it prints no accidental itself.
+
+def resolve_alters(part: Part) -> None:
+    """Set the sounding ``alter`` of every note from its notated context.
+
+    A note takes the alteration of the latest accidental printed on its staff
+    position earlier in the measure, else the one of the key signature. A note
+    ending a tie takes the alteration of the note starting it.
     """
-
-    def __init__(self) -> None:
-        self.key = 0
-        self._carried: dict[PitchKey, list[tuple[Fraction, float]]] = {}
-        self._ties: dict[PitchKey, float] = {}
-        self._previous_ties: dict[PitchKey, float] = {}
-
-    def start_measure(self) -> None:
-        self._carried = {}
-        self._previous_ties, self._ties = self._ties, {}
-
-    def record(self, key: PitchKey, onset: Fraction, alter: float) -> None:
-        self._carried.setdefault(key, []).append((onset, alter))
-
-    def tie_start(self, key: PitchKey, alter: float) -> None:
-        self._ties[key] = alter
-
-    def expected(self, key: PitchKey, onset: Fraction, tie_stop: bool) -> float:
-        if tie_stop:
-            for ties in (self._ties, self._previous_ties):
-                if key in ties:
-                    return ties.pop(key)
-        best: tuple[Fraction, float] | None = None
-        for carried in self._carried.get(key, ()):
-            if carried[0] <= onset and (best is None or carried[0] >= best[0]):
-                best = carried
-        if best is not None:
-            return best[1]
-        return key_alter(self.key, key[1])
-
-
-def resolve_alters(part: Part, accidental_alters: Mapping[str, int]) -> None:
-    """Set ``Note.alter`` of every note from key signatures, accidentals and ties."""
-    tracker = AlterTracker()
+    fifths = 0
+    tie_starts: dict[PitchKey, Note] = {}
     for measure in part.measures:
-        tracker.start_measure()
+        printed: dict[PitchKey, list[tuple[Fraction, int]]] = {}
+        for note, key, onset in _pitched_notes(measure):
+            if note.accidental in ACCIDENTAL_ALTERS:
+                alter = ACCIDENTAL_ALTERS[note.accidental]
+                printed.setdefault(key, []).append((onset, alter))
+        for accidentals in printed.values():
+            accidentals.sort(key=lambda accidental: accidental[0])
+        previous_tie_starts, tie_starts = tie_starts, {}
         onsets = measure_onsets(measure)
         for element, onset in zip(measure.elements, onsets, strict=True):
             if isinstance(element, Attributes) and element.key is not None:
-                tracker.key = element.key
-            elif isinstance(element, Note) and (key := pitch_key(element)):
-                alter = accidental_alters.get(element.accidental or "")
-                if alter is not None:
-                    tracker.record(key, onset, alter)
-        for element, onset in zip(measure.elements, onsets, strict=True):
-            if isinstance(element, Note) and (key := pitch_key(element)):
-                printed = accidental_alters.get(element.accidental or "")
-                if printed is not None:  # a printed accidental always wins
-                    element.alter = printed
-                else:
-                    element.alter = tracker.expected(key, onset, "stop" in element.ties)
-                if "start" in element.ties:
-                    tracker.tie_start(key, element.alter)
+                fifths = element.key
+            if not isinstance(element, Note) or (place := pitch_key(element)) is None:
+                continue
+            carried = [alter for at, alter in printed.get(place, []) if at <= onset]
+            element.alter = carried[-1] if carried else key_alter(fifths, place[1])
+            if "stop" in element.ties:
+                origin = tie_starts if place in tie_starts else previous_tie_starts
+                tied_from = origin.pop(place, None)
+                if tied_from is not None:
+                    element.alter = tied_from.alter
+            if "start" in element.ties:
+                tie_starts[place] = element
 
 
-def assign_accidentals(part: Part, alter_accidentals: Mapping[int, str]) -> None:
-    """Set ``Note.accidental`` so that ``resolve_alters`` recovers ``Note.alter``.
+def assign_accidentals(part: Part) -> None:
+    """Set the printed ``accidental`` of every note from its ``alter``.
 
-    Accidentals are printed only where the alteration is not implied by the
-    key signature, an earlier accidental of the measure or a tie.
+    The inverse of :func:`resolve_alters`: an accidental is printed only where
+    the alteration is not implied by the key signature, an earlier accidental
+    of the measure or a tie.
     """
-    tracker = AlterTracker()
+    alter_to_accidental = {
+        alter: name for name, alter in reversed(ACCIDENTAL_ALTERS.items())
+    }
+    fifths = 0
+    tie_alters: dict[PitchKey, float] = {}
     for measure in part.measures:
-        tracker.start_measure()
-        onsets = measure_onsets(measure)
         for element in measure.elements:
             if isinstance(element, Attributes) and element.key is not None:
-                tracker.key = element.key
-        # Accidentals carry by onset, not document order (voices are sequential)
-        by_onset = sorted(
-            zip(measure.elements, onsets, strict=True), key=lambda x: x[1]
-        )
-        for element, onset in by_onset:
-            if isinstance(element, Note) and (key := pitch_key(element)):
-                expected = tracker.expected(key, onset, "stop" in element.ties)
-                if element.alter == expected:
-                    element.accidental = None
-                else:
-                    element.accidental = alter_accidentals[int(element.alter)]
-                    tracker.record(key, onset, element.alter)
-                if "start" in element.ties:
-                    tracker.tie_start(key, element.alter)
+                fifths = element.key
+        carried: dict[PitchKey, float] = {}
+        previous_tie_alters, tie_alters = tie_alters, {}
+        for note, key, _ in sorted(_pitched_notes(measure), key=lambda x: x[2]):
+            expected: float = carried.get(key, key_alter(fifths, key[1]))
+            if "stop" in note.ties:
+                expected = tie_alters.pop(key, previous_tie_alters.pop(key, expected))
+            if note.alter == expected:
+                note.accidental = None
+            else:
+                note.accidental = alter_to_accidental.get(round(note.alter))
+                carried[key] = note.alter
+            if "start" in note.ties:
+                tie_alters[key] = note.alter
