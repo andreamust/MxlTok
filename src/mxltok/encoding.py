@@ -1,36 +1,29 @@
-"""Score IR -> token events, one part at a time."""
+"""Encode one part of a :class:`~mxltok.score.Score` into LMX tokens.
+
+A part becomes a flat token list: each measure starts with ``measure`` and
+lists its elements in document order. A note is written as prefix tokens, one
+root token (its type) and suffix tokens::
+
+    [print-object:no] [grace [grace:slash]] [chord] <pitch | rest> [voice:N]
+    <type | rest:measure>
+    [<ratio>] [dot]* [stem:S] [staff:N] [beam:B]* [tied:T]* [tuplet:T]*
+    [<marking>]* [slur:T]*
+
+``voice``, ``stem`` and ``staff`` are delta-encoded: they are only written
+when they change within the measure. See ``docs/format.md`` for the whole
+specification.
+"""
 
 from __future__ import annotations
 
 import warnings
-from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 
-from mxltok.classes import Event, MxlTokError, TokenizerConfig
-from mxltok.constants import (
-    ACCIDENTAL_ALTER,
-    ACCIDENTAL_TO_SUFFIX,
-    ALTER_TO_ACCIDENTAL,
-    ARTICULATIONS,
-    BEAMS,
-    CLEFS,
-    DYNAMICS,
-    HARMONY_ALTERS,
-    HARMONY_KINDS,
-    NOTATIONS,
-    NOTE_TYPE_QUARTERS,
-    NOTE_TYPES,
-    ORNAMENTS,
-    PEDALS,
-    PITCH_STEPS,
-    STEMS,
-    TREMOLO_MARKS,
-    TREMOLO_TYPES,
-    WEDGES,
-)
+from mxltok.config import TokenizerConfig
+from mxltok.errors import MxlTokError
+from mxltok.intervals import absolute_to_interval
 from mxltok.score import (
-    AlterTracker,
     Attributes,
     Backup,
     Barline,
@@ -40,454 +33,320 @@ from mxltok.score import (
     Measure,
     Note,
     Part,
-    measure_onsets,
-    pitch_key,
+)
+from mxltok.vocabulary import (
+    ACCIDENTAL_TO_SUFFIX,
+    ALTER_TO_ACCIDENTAL,
+    BACKUP,
+    DYNAMICS,
+    FORWARD,
+    HARMONY_ALTERS,
+    HARMONY_KINDS,
+    MEASURE,
+    NOTE_MARKINGS,
+    NOTE_TYPE_QUARTERS,
+    NOTE_TYPES,
+    PEDALS,
+    PERCUSSION_CLEF,
+    PITCHES,
+    REPEAT_BACKWARD,
+    REPEAT_FORWARD,
+    STEMS,
+    TEMPO_GRID,
+    WEDGES,
 )
 
-_DEFAULT_CLEF_LINES = {"G": 2, "F": 4, "C": 3}
-_MAX_TYPE = NOTE_TYPE_QUARTERS[NOTE_TYPES[-1]]
+_PITCHES = frozenset(PITCHES)
+_BEAM_TOKENS = {
+    "forward hook": "beam:forward-hook",
+    "backward hook": "beam:backward-hook",
+}
 
 
-def pitch_token(step: str, octave: int, accidental: str | None) -> str:
-    """``Pitch`` token value, e.g. ``C4``, ``F4#``, ``B3bb``."""
-    suffix = ACCIDENTAL_TO_SUFFIX[accidental] if accidental else ""
-    return f"{step}{octave}{suffix}"
+class _Unencodable(Exception):
+    """An element that cannot be encoded: it is dropped with a warning."""
 
 
-def note_type_of(duration: Fraction) -> tuple[str, int] | None:
-    """Infer ``(type, dots)`` from an undotted/dotted plain duration, if any."""
-    for dots in range(4):
-        factor = 2 - Fraction(1, 2**dots)
-        base = duration / factor
-        for name, quarters in NOTE_TYPE_QUARTERS.items():
-            if quarters == base:
-                return name, dots
-    return None
-
-
-def diatonic_index(step: str, octave: int) -> int:
-    """Position of a note on the diatonic scale (C0 = 0, one per step)."""
-    return octave * 7 + PITCH_STEPS.index(step)
-
-
-@dataclass(slots=True)
+@dataclass
 class _State:
-    staves: int = 1
+    """What the encoder remembers while walking a part."""
+
+    # Part scope
+    clefs: dict[int, str] = field(default_factory=dict)  # clef token per staff
+    staves: int | None = None  # highest staff number announced by a clef
+
+    # Measure scope (delta encoding)
     voice: int | None = None
-    staff: int | None = None
     stem: str | None = None
-    prev_pitch: int | None = None  # diatonic index of the previous pitched note
+    staff: int | None = None
+    previous_pitch: str | None = None  # for pitch_mode="interval"
 
-    def reset(self) -> None:
-        self.voice = self.staff = self.stem = None
-
-    def new_measure(self) -> None:
-        self.reset()
-        self.prev_pitch = None
+    def start_measure(self) -> None:
+        self.voice = self.stem = self.staff = self.previous_pitch = None
 
 
 class PartEncoder:
-    """Turn a :class:`Part` into per-measure lists of :class:`Event`."""
+    """Turns the measures of a :class:`~mxltok.score.Part` into LMX tokens."""
 
     def __init__(self, config: TokenizerConfig) -> None:
         self.config = config
-        self._tempos = config.tempos
-        self._time_signatures = set(config.time_signatures)
-        self._note_types = set(config.note_types)
-        self._tuplet_ratios = set(config.tuplet_ratios)
 
-    @staticmethod
-    def _problem(message: str, strict: bool) -> None:
-        if strict:
-            raise MxlTokError(message)
-        warnings.warn(message, stacklevel=3)
+    def encode(self, part: Part) -> list[str]:
+        """Return the LMX tokens of a part (without the ``part:*`` tokens).
 
-    def _clamp(self, name: str, value: int, maximum: int, strict: bool) -> int:
-        if value <= maximum:
-            return max(value, 1)
-        self._problem(
-            f"{name} {value} exceeds the configured maximum {maximum}", strict
-        )
-        return maximum
-
-    def encode(self, part: Part, strict: bool = False) -> list[list[Event]]:
+        Elements that cannot be encoded (an unknown accidental or stem, a
+        cursor move that is not a sum of note types) are skipped with a
+        warning. Content that makes the whole part unencodable (a pitch
+        outside A0-B9, an unknown note type) raises :class:`MxlTokError`.
+        """
         state = _State()
-        tracker = AlterTracker()
-        measures: list[list[Event]] = []
-        for index, measure in enumerate(part.measures):
-            state.new_measure()
-            tracker.start_measure()
-            events: list[Event] = []
-            onsets = measure_onsets(measure)
-            self._record_accidentals(measure, onsets, tracker)
-            for element, onset in zip(measure.elements, onsets, strict=True):
-                match element:
-                    case Note():
-                        events += self._note(element, state, tracker, onset, strict)
-                    case Backup():
-                        events += self._chunks("Backup", element.duration, strict)
-                        state.reset()
-                    case Forward():
-                        events += self._chunks("Forward", element.duration, strict)
-                    case Attributes():
-                        events += self._attributes(element, state, tracker, strict)
-                    case Direction():
-                        events += self._direction(element, strict)
-                    case Harmony():
-                        events += self._harmony(element, strict)
-                    case Barline():
-                        events += self._barline(element)
-            for event in events:
-                event.time = index
-            measures.append(events)
-        return measures
+        tokens: list[str] = []
+        for measure in part.measures:
+            state.start_measure()
+            repeats = [
+                element.repeat
+                for element in measure.elements
+                if isinstance(element, Barline)
+            ]
+            # Repeats precede the measure token of their measure: backward ones
+            # always, forward ones only when the measure has content.
+            tokens += [REPEAT_BACKWARD] * repeats.count("backward")
+            events = self._measure_events(measure, state)
+            if events:
+                tokens += [REPEAT_FORWARD] * repeats.count("forward")
+                tokens.append(MEASURE)
+                tokens += [token for event in events for token in event]
+        return tokens
+
+    def _measure_events(self, measure: Measure, state: _State) -> list[list[str]]:
+        """Return the tokens of each encodable element of a measure.
+
+        An element that fails to encode still counts as an event (with no
+        tokens), so that its measure keeps its ``measure`` token.
+        """
+        events: list[list[str] | None] = []
+        for element in measure.elements:
+            if isinstance(element, Attributes):
+                events += self._attributes(element, state)
+                continue
+            try:
+                if isinstance(element, Note):
+                    events.append(self._note(element, state))
+                elif isinstance(element, Backup | Forward):
+                    events.append(self._cursor_move(element, state))
+                elif isinstance(element, Direction):
+                    events.append(self._direction(element))
+                elif isinstance(element, Harmony):
+                    events.append(self._harmony(element))
+            except _Unencodable as exc:
+                warnings.warn(str(exc), stacklevel=2)
+                events.append([])
+        return [event for event in events if event is not None]
+
+    # ------------------------------------------------------------- notes
+
+    def _note(self, note: Note, state: _State) -> list[str] | None:
+        """Return the tokens of a note, or ``None`` if it is not encoded."""
+        if (note.grace and not self.config.include_grace_notes) or (
+            note.rest and not self.config.include_rests
+        ):
+            return None
+        if not note.rest and not note.is_pitched:
+            return None  # unpitched (percussion) notes are not encoded
+        note_type = note.type_
+        if note_type is None:
+            if note.measure_rest:
+                note_type = "whole"
+            elif note.grace:
+                note_type = "eighth"
+            else:
+                return None
+
+        tokens: list[str] = []
+        if not note.print_object:
+            tokens.append("print-object:no")
+        if note.grace:
+            tokens.append("grace")
+            if note.grace_slash:
+                tokens.append("grace:slash")
+        if note.chord:
+            tokens.append("chord")
+        if note.rest:
+            tokens.append("rest")
+        else:
+            tokens.append(self._pitch(note, state))
+
+        if note.voice is not None:
+            if note.voice != state.voice:
+                tokens.append(f"voice:{note.voice}")
+            state.voice = note.voice
+
+        if note.measure_rest:
+            tokens.append("rest:measure")
+        elif note_type in NOTE_TYPE_QUARTERS:
+            tokens.append(note_type)
+        else:
+            raise MxlTokError(f"Unknown note type: {note_type!r}")
+
+        if note.time_modification is not None:
+            actual, normal = note.time_modification
+            tokens.append(f"{actual}in{normal}")
+        tokens += ["dot"] * note.dots
+        if note.stem is not None:
+            if note.stem not in STEMS:
+                raise _Unencodable(f"Unknown stem type '{note.stem}'.")
+            if note.stem != state.stem:
+                tokens.append(f"stem:{note.stem}")
+                state.stem = note.stem
+        if state.staves is not None and state.staves >= 2:
+            staff = 1 if note.staff is None else note.staff
+            if staff != state.staff:
+                tokens.append(f"staff:{staff}")
+                state.staff = staff
+        for beam in note.beams:
+            if beam != "continue":
+                tokens.append(_BEAM_TOKENS.get(beam, f"beam:{beam}"))
+        tokens += [f"tied:{tie}" for tie in note.ties if tie in ("start", "stop")]
+        tokens += [f"tuplet:{tuplet}" for tuplet in note.tuplets]
+        tokens += [mark for mark in _markings(note) if _is_note_marking(mark)]
+        tokens += [f"slur:{slur}" for slur in note.slurs]
+        return tokens
+
+    def _pitch(self, note: Note, state: _State) -> str:
+        """Return the pitch token of a note: pitch plus accidental suffix.
+
+        The suffix is the printed accidental, else the one implied by the
+        sounding alteration. In interval mode, every pitch but the first of
+        the measure is written as an interval from the previous one.
+        """
+        pitch = f"{note.step}{note.octave}"
+        if pitch not in _PITCHES:
+            raise MxlTokError(f"Pitch out of range: {pitch!r}")
+        accidental = note.accidental or ALTER_TO_ACCIDENTAL.get(note.alter)
+        if accidental is not None:
+            if accidental not in ACCIDENTAL_TO_SUFFIX:
+                raise _Unencodable(f"Unsupported accidental type: {accidental}")
+            pitch += ACCIDENTAL_TO_SUFFIX[accidental]
+        if self.config.pitch_mode == "interval":
+            token = absolute_to_interval(pitch, state.previous_pitch)
+            state.previous_pitch = pitch
+            return token
+        return pitch
+
+    # -------------------------------------------------- other elements
+
+    def _attributes(self, attributes: Attributes, state: _State) -> list[list[str]]:
+        """Return one event per key, time signature and clef.
+
+        A clef without ``<sign>`` repeats the last clef of its staff. A clef is
+        followed by its staff number when the attributes declare ``<staves>``.
+        """
+        events: list[list[str]] = []
+        if attributes.key is not None:
+            events.append([f"key:fifths:{attributes.key}"])
+        if attributes.time is not None:
+            beats, beat_type = attributes.time
+            events.append([f"time:num:{beats}", f"time:den:{beat_type}"])
+        for clef in attributes.clefs:
+            if clef.sign is not None:
+                state.clefs[clef.number] = (
+                    PERCUSSION_CLEF
+                    if clef.sign.lower() == "percussion"
+                    else f"clef:{clef.sign}{'' if clef.line is None else clef.line}"
+                )
+        for clef in attributes.clefs:
+            if clef.number not in state.clefs:
+                continue
+            event = [state.clefs[clef.number]]
+            if attributes.staves is not None:
+                event.append(f"staff:{clef.number}")
+                state.staves = max(state.staves or 0, clef.number)
+            events.append(event)
+        return events
 
     @staticmethod
-    def _record_accidentals(
-        measure: Measure, onsets: list[Fraction], tracker: AlterTracker
-    ) -> None:
-        for element, onset in zip(measure.elements, onsets, strict=True):
-            if isinstance(element, Attributes) and element.key is not None:
-                tracker.key = element.key
-            elif isinstance(element, Note) and (key := pitch_key(element)):
-                alter = ACCIDENTAL_ALTER.get(element.accidental or "")
-                if alter is not None:
-                    tracker.record(key, onset, alter)
+    def _cursor_move(move: Backup | Forward, state: _State) -> list[str]:
+        """Return a backup/forward as ``backup <type>`` pairs summing up to it.
 
-    def _accidental(
-        self, note: Note, tracker: AlterTracker, onset: Fraction, strict: bool
-    ) -> str | None:
-        """Printed accidental, or the one needed when ``alter`` is not implied."""
-        if note.accidental is not None:
-            if note.accidental in ACCIDENTAL_TO_SUFFIX:
-                accidental = note.accidental
-            else:
-                self._problem(f"Unsupported accidental {note.accidental!r}", strict)
-                accidental = None
-        else:
-            accidental = None
-            key = pitch_key(note)
-            if key is not None:
-                expected = tracker.expected(key, onset, "stop" in note.ties)
-                if note.alter != expected:
-                    accidental = ALTER_TO_ACCIDENTAL.get(int(note.alter))
-                    if accidental is None:
-                        self._problem(f"Unsupported alteration {note.alter}", strict)
-                    else:
-                        tracker.record(key, onset, note.alter)
-        key = pitch_key(note)
-        if key is not None and "start" in note.ties:
-            tracker.tie_start(key, note.alter)
-        return accidental
-
-    def _note(
-        self,
-        note: Note,
-        state: _State,
-        tracker: AlterTracker,
-        onset: Fraction,
-        strict: bool,
-    ) -> list[Event]:
-        cfg = self.config
-        if (note.grace and not cfg.use_grace_notes) or (
-            note.rest and not cfg.use_rests
-        ):
-            return []
-        if not note.rest and (note.step is None or note.octave is None):
-            self._problem("Note without pitch skipped", strict)
-            return []
-        root = self._root(note, strict)
-        if root is None:
-            return []
-        events: list[Event] = []
-        if not note.print_object and cfg.use_print_object:
-            events.append(Event("Hidden", "None"))
-        if note.grace:
-            events.append(Event("Grace", "slash" if note.grace_slash else "None"))
-        if note.chord:
-            events.append(Event("Chord", "None"))
-        if note.rest:
-            if not note.rest_measure:
-                events.append(Event("Rest", "None"))
-        else:
-            assert note.step is not None and note.octave is not None
-            lo, hi = cfg.octave_range
-            if not lo <= note.octave <= hi:
-                self._problem(
-                    f"Octave {note.octave} outside {cfg.octave_range}", strict
-                )
-                return []
-            accidental = self._accidental(note, tracker, onset, strict)
-            events.append(self._pitch_event(note.step, note.octave, accidental, state))
-        if cfg.use_voices and note.voice is not None:
-            voice = self._clamp("Voice", note.voice, cfg.max_voices, strict)
-            if voice != state.voice:
-                events.append(Event("Voice", voice))
-                state.voice = voice
-        events.extend(root)
-        events.extend(self._note_suffixes(note, state, strict))
-        return events
-
-    def _pitch_event(
-        self, step: str, octave: int, accidental: str | None, state: _State
-    ) -> Event:
-        index = diatonic_index(step, octave)
-        previous, state.prev_pitch = state.prev_pitch, index
-        if self.config.pitch_mode == "interval" and previous is not None:
-            steps = index - previous
-            if abs(steps) <= self.config.max_pitch_interval:
-                suffix = ACCIDENTAL_TO_SUFFIX[accidental] if accidental else ""
-                return Event("Interval", f"{steps:+d}{suffix}")
-        return Event("Pitch", pitch_token(step, octave, accidental))
-
-    def _root(self, note: Note, strict: bool) -> list[Event] | None:
-        """``Duration``/``TimeMod``/``Dot`` events, or a ``RestMeasure`` root."""
-        if note.rest_measure:
-            return [Event("RestMeasure", "None")]
-        type_, dots = note.type_, note.dots
-        if type_ is None:
-            inferred = note_type_of(note.duration) if not note.grace else ("eighth", 0)
-            if inferred is None:
-                self._problem(
-                    f"Cannot infer a note type for duration {note.duration}", strict
-                )
-                return None
-            type_, dots = inferred
-        if type_ not in self._note_types:
-            self._problem(f"Unsupported note type {type_!r}", strict)
-            return None
-        events = [Event("Duration", type_)]
-        if note.time_mod is not None:
-            ratio = f"{note.time_mod[0]}in{note.time_mod[1]}"
-            if ratio not in self._tuplet_ratios:
-                self._problem(f"Unsupported tuplet ratio {ratio}", strict)
-                return None
-            events.append(Event("TimeMod", ratio))
-        if dots:
-            events.append(
-                Event("Dot", self._clamp("Dot", dots, self.config.max_dots, strict))
+        A backup resets the delta encoding: the next voice states its voice,
+        stem and staff again.
+        """
+        tag = BACKUP if isinstance(move, Backup) else FORWARD
+        note_types, exact = split_duration(move.duration)
+        if isinstance(move, Backup):
+            state.voice = state.staff = state.stem = None
+        tokens = [token for note_type in note_types for token in (tag, note_type)]
+        if not exact:
+            warnings.warn(
+                f"The {tag} duration {move.duration} is not a sum of note types "
+                "(most likely a tuplet cursor move); it is only partially encoded.",
+                stacklevel=2,
             )
-        return events
+        return tokens
 
-    def _note_suffixes(self, note: Note, state: _State, strict: bool) -> list[Event]:
-        cfg = self.config
-        events: list[Event] = []
-        if cfg.use_stems and note.stem is not None:
-            if note.stem not in STEMS:
-                self._problem(f"Unsupported stem {note.stem!r}", strict)
-            elif note.stem != state.stem:
-                events.append(Event("Stem", note.stem))
-                state.stem = note.stem
-        if cfg.use_staves and note.staff is not None and state.staves > 1:
-            staff = self._clamp("Staff", note.staff, cfg.max_staves, strict)
-            if staff != state.staff:
-                events.append(Event("Staff", staff))
-                state.staff = staff
-        if cfg.use_beams:
-            for beam in note.beams:
-                value = beam.replace(" ", "-")
-                if value == "continue":
-                    continue
-                if value not in BEAMS:
-                    self._problem(f"Unsupported beam {beam!r}", strict)
-                    continue
-                events.append(Event("Beam", value))
-        if cfg.use_ties:
-            events += [Event("Tie", t) for t in note.ties if t in ("start", "stop")]
-        if cfg.use_tuplets:
-            events += [
-                Event("Tuplet", t) for t in note.tuplets if t in ("start", "stop")
-            ]
-        if cfg.use_slurs:
-            events += [Event("Slur", t) for t in note.slurs if t in ("start", "stop")]
-        if cfg.use_articulations:
-            events += self._known(
-                "Articulation", note.articulations, ARTICULATIONS, strict
-            )
-        if cfg.use_ornaments:
-            for ornament in note.ornaments:
-                if ornament.startswith("tremolo:"):
-                    events += self._tremolo(ornament, strict)
-                else:
-                    events += self._known("Ornament", (ornament,), ORNAMENTS, strict)
-        if cfg.use_notations:
-            events += self._known("Notation", note.notations, NOTATIONS, strict)
-        return events
+    @staticmethod
+    def _direction(direction: Direction) -> list[str] | None:
+        """Return the token of a direction, or ``None`` if it is not encoded."""
+        known = {"dynamics": DYNAMICS, "wedge": WEDGES, "pedal": PEDALS}
+        if direction.kind == "tempo":
+            return [f"tempo:{quantize_tempo(int(direction.value))}"]
+        if direction.value in known.get(direction.kind, ()):
+            return [f"{direction.kind}:{direction.value}"]
+        return None
 
-    def _known(
-        self,
-        type_: str,
-        values: tuple[str, ...],
-        allowed: tuple[str, ...],
-        strict: bool,
-    ) -> list[Event]:
-        events: list[Event] = []
-        for value in values:
-            if value in allowed:
-                events.append(Event(type_, value))
-            else:
-                self._problem(f"Unsupported {type_.lower()} {value!r}", strict)
-        return events
-
-    def _tremolo(self, ornament: str, strict: bool) -> list[Event]:
-        _, kind, marks = ornament.split(":")
-        if (
-            kind not in TREMOLO_TYPES
-            or not marks.isdigit()
-            or int(marks) not in TREMOLO_MARKS
-        ):
-            self._problem(f"Unsupported tremolo {ornament!r}", strict)
-            return []
-        return [Event("Tremolo", f"{kind}-{int(marks)}")]
-
-    def _chunks(self, type_: str, duration: Fraction, strict: bool) -> list[Event]:
-        """Decompose a backup/forward duration into note-type (+ tuplet) chunks."""
-        parts = self._decompose(duration)
-        if parts is None:
-            self._problem(
-                f"{type_} duration {duration} cannot be written with note types", strict
-            )
-            rounded = round(duration * 256) / 256
-            parts = self._decompose(Fraction(rounded)) or []
-        events: list[Event] = []
-        for note_type, ratio in parts:
-            events += [Event(type_, "None"), Event("Duration", note_type)]
-            if ratio is not None:
-                events.append(Event("TimeMod", ratio))
-        return events
-
-    def _decompose(self, duration: Fraction) -> list[tuple[str, str | None]] | None:
-        if duration <= 0:
-            return [] if duration == 0 else None
-        if _is_dyadic(duration):
-            return [(t, None) for t in self._binary(duration)]
-        for ratio in self.config.tuplet_ratios:
-            actual, normal = map(int, ratio.split("in"))
-            scaled = duration * actual / normal
-            if _is_dyadic(scaled):
-                return [(t, ratio) for t in self._binary(scaled)]
-        largest = next(
-            (
-                t
-                for t in reversed(self.config.note_types)
-                if NOTE_TYPE_QUARTERS[t] <= duration
-            ),
-            None,
-        )
-        if largest is None:
-            return None
-        rest = self._decompose(duration - NOTE_TYPE_QUARTERS[largest])
-        return None if rest is None else [(largest, None), *rest]
-
-    def _binary(self, duration: Fraction) -> list[str]:
-        """Greedy decomposition of a dyadic duration into allowed note types."""
-        chunks: list[str] = []
-        for note_type in reversed(self.config.note_types):
-            quarters = NOTE_TYPE_QUARTERS[note_type]
-            while duration >= quarters:
-                chunks.append(note_type)
-                duration -= quarters
-        return chunks
-
-    def _attributes(
-        self, attributes: Attributes, state: _State, tracker: AlterTracker, strict: bool
-    ) -> list[Event]:
-        cfg = self.config
-        events: list[Event] = []
-        if attributes.key is not None:
-            tracker.key = attributes.key
-            if cfg.use_key_signatures:
-                lo, hi = cfg.key_range
-                if not lo <= attributes.key <= hi:
-                    self._problem(
-                        f"Key {attributes.key} outside {cfg.key_range}", strict
-                    )
-                events.append(Event("Key", min(max(attributes.key, lo), hi)))
-        if attributes.time is not None and cfg.use_time_signatures:
-            value = f"{attributes.time[0]}/{attributes.time[1]}"
-            if value in self._time_signatures:
-                events.append(Event("TimeSig", value))
-            else:
-                self._problem(f"Time signature {value} not in the vocabulary", strict)
-        state.staves = max(
-            state.staves,
-            attributes.staves or 0,
-            *(clef.number for clef in attributes.clefs),
-        )
-        if cfg.use_clefs:
-            for clef in attributes.clefs:
-                if clef.sign.lower() == "percussion":
-                    value = "percussion"
-                else:
-                    line = clef.line or _DEFAULT_CLEF_LINES.get(clef.sign, 2)
-                    value = f"{clef.sign}{line}"
-                if value not in CLEFS:
-                    self._problem(f"Unsupported clef {value!r}", strict)
-                    continue
-                events.append(Event("Clef", value))
-                if cfg.use_staves and state.staves > 1:
-                    events.append(
-                        Event(
-                            "Staff",
-                            self._clamp("Staff", clef.number, cfg.max_staves, strict),
-                        )
-                    )
-        return events
-
-    def _direction(self, direction: Direction, strict: bool) -> list[Event]:
-        cfg = self.config
-        match direction.kind:
-            case "dynamics" if cfg.use_dynamics:
-                return self._known("Dynamics", (direction.value,), DYNAMICS, strict)
-            case "wedge" if cfg.use_wedges:
-                return self._known("Wedge", (direction.value,), WEDGES, strict)
-            case "pedal" if cfg.use_pedals:
-                return self._known("Pedal", (direction.value,), PEDALS, strict)
-            case "tempo" if cfg.use_tempos:
-                return [Event("Tempo", self._nearest_tempo(int(direction.value)))]
-        return []
-
-    def _nearest_tempo(self, bpm: int) -> int:
-        tempos = self._tempos
-        index = bisect_left(tempos, bpm)
-        if index == 0:
-            return tempos[0]
-        if index == len(tempos):
-            return tempos[-1]
-        before, after = tempos[index - 1], tempos[index]
-        return before if bpm - before <= after - bpm else after
-
-    def _harmony(self, harmony: Harmony, strict: bool) -> list[Event]:
-        if not self.config.use_harmonies:
-            return []
-        if (
-            harmony.root_alter not in HARMONY_ALTERS
-            or harmony.bass_alter not in HARMONY_ALTERS
-        ):
-            self._problem("Harmony root/bass alterations must be within -1..1", strict)
-            return []
-        kind = harmony.kind
-        if kind not in HARMONY_KINDS:
-            self._problem(f"Unsupported harmony kind {kind!r}", strict)
-            kind = "other"
-        events = [
-            Event("HarmonyRoot", f"{harmony.root}{HARMONY_ALTERS[harmony.root_alter]}"),
-            Event("HarmonyKind", kind),
+    @staticmethod
+    def _harmony(harmony: Harmony) -> list[str]:
+        quality, extension = HARMONY_KINDS.get(harmony.kind, (harmony.kind, None))
+        tokens = [
+            f"harmony:root:{harmony.root}{HARMONY_ALTERS.get(harmony.root_alter, '')}",
+            f"harmony:quality:{quality}",
         ]
+        if extension is not None:
+            tokens.append(f"harmony:ext:{extension}")
         if harmony.bass is not None:
-            events.append(
-                Event(
-                    "HarmonyBass", f"{harmony.bass}{HARMONY_ALTERS[harmony.bass_alter]}"
-                )
-            )
-        return events
-
-    def _barline(self, barline: Barline) -> list[Event]:
-        if self.config.use_repeats and barline.repeat in ("forward", "backward"):
-            return [Event("Repeat", barline.repeat)]
-        return []
+            bass_alter = HARMONY_ALTERS.get(harmony.bass_alter, "")
+            tokens.append(f"harmony:bass:{harmony.bass}{bass_alter}")
+        return tokens
 
 
-def _is_dyadic(duration: Fraction) -> bool:
-    denominator = duration.denominator
-    return denominator <= 256 and denominator & (denominator - 1) == 0
+def _markings(note: Note) -> list[str]:
+    """Return the candidate marking tokens of a note, in encoding order."""
+    markings = list(note.articulations)
+    if note.fermata:
+        markings.append("fermata")
+    if note.arpeggiate:
+        markings.append("arpeggiate")
+    for ornament in note.ornaments:
+        if ornament == "tremolo" and note.tremolo is not None:
+            tremolo_type, marks = note.tremolo
+            markings += [f"tremolo:{tremolo_type}", f"tremolo:{marks}"]
+        else:
+            markings.append(ornament)
+    markings += [f"glissando:{glissando}" for glissando in note.glissandos]
+    return markings
+
+
+def _is_note_marking(token: str) -> bool:
+    return token in NOTE_MARKINGS or token.startswith(("tremolo:", "glissando:"))
+
+
+def split_duration(duration: Fraction) -> tuple[list[str], bool]:
+    """Split a duration into distinct note types, longest first.
+
+    Returns:
+        The note types and whether they sum up to ``duration`` exactly.
+    """
+    note_types = []
+    remainder = duration
+    for note_type in reversed(NOTE_TYPES):
+        if remainder <= 0:
+            break
+        if NOTE_TYPE_QUARTERS[note_type] <= remainder:
+            note_types.append(note_type)
+            remainder -= NOTE_TYPE_QUARTERS[note_type]
+    return note_types, remainder == 0
+
+
+def quantize_tempo(bpm: int) -> int:
+    """Return the tempo of :data:`~mxltok.vocabulary.TEMPO_GRID` nearest to ``bpm``."""
+    return min(TEMPO_GRID, key=lambda grid_bpm: abs(grid_bpm - bpm))

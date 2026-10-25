@@ -1,18 +1,35 @@
-"""MxlTok: MusicXML tokenization."""
+"""MxlTok: tokenize MusicXML scores into LMX token sequences, and back.
 
-from mxltok.classes import Event, MxlTokError, TokenizerConfig, TokSequence
-from mxltok.mxl import MXL
-from mxltok.tokenizer import MusicTokenizer
-from mxltok.utils import split_files_for_training, transpose
+Example:
+    >>> from mxltok import MXLTokenizer, write_musicxml
+    >>> tokenizer = MXLTokenizer()
+    >>> sequence = tokenizer.encode("score.mxl")
+    >>> write_musicxml(tokenizer.decode(sequence.ids), "decoded.musicxml")
+"""
+
+from mxltok.bpe import BPE
+from mxltok.categories import TokenCategory, classify_token
+from mxltok.config import SpecialTokens, TokenizerConfig
+from mxltok.errors import MxlTokError
+from mxltok.musicxml import read_musicxml, write_musicxml
+from mxltok.score import Score
+from mxltok.tokenizer import MXLTokenizer, TokSequence
+from mxltok.transpose import transpose
+
+__version__ = "0.1.0"
 
 __all__ = [
-    "MXL",
-    "Event",
-    "MusicTokenizer",
+    "BPE",
+    "MXLTokenizer",
     "MxlTokError",
+    "Score",
+    "SpecialTokens",
     "TokSequence",
+    "TokenCategory",
     "TokenizerConfig",
     "__version__",
-    "split_files_for_training",
+    "classify_token",
+    "read_musicxml",
     "transpose",
+    "write_musicxml",
 ]

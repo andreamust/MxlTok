@@ -1,0 +1,44 @@
+{
+  "duration_mode": "duration_position",
+  "pitch_mode": "absolute",
+  "include_chords": true,
+  "include_rests": true,
+  "include_grace_notes": false,
+  "ticks_per_quarter": 4,
+  "max_bar_embedding": 512,
+  "features": {
+    "velocity": false,
+    "tempo": true,
+    "time_signature": true,
+    "key_signature": true,
+    "dynamics": true,
+    "articulations": true,
+    "ornaments": true,
+    "pedal": true,
+    "harmony": true,
+    "ties": true,
+    "slurs": true,
+    "beams": true,
+    "stems": true,
+    "tuplets": true,
+    "repeats": true
+  },
+  "special_tokens": {
+    "pad": "<PAD>",
+    "bos": "<BOS>",
+    "eos": "<EOS>",
+    "unk": "<UNK>",
+    "mask": "<MASK>"
+  },
+  "excluded_categories": [],
+  "token_order": null,
+  "pitch_shift_range": [
+    0,
+    0
+  ],
+  "max_parts": 0,
+  "add_bos_eos": true,
+  "arrangement": "measure_first",
+  "prepend_instruments": true,
+  "octuple_active_extended_types": []
+}
